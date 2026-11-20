@@ -3,6 +3,8 @@
  * Crawls https://javhd.today/releaseday/?ajax=browse_videos&page={p}
  * Builds the complete deduplicated catalog with basic metadata (~380,000 items)
  * Automatically partitions output into <75 MB files (javhd_catalog_part1.json, etc.)
+ * Resilient retry mechanism: NEVER skips failed pages without retrying, and only marks
+ * truly completed pages in checkpoint.
  */
 
 import fs from 'node:fs';
@@ -61,6 +63,7 @@ function loadCheckpoint() {
         catalog: {
             totalVideos: 0,
             lastIndexedPage: 0,
+            failedPages: [],
             totalPages: 13571,
             isComplete: false,
             updatedAt: null
@@ -89,7 +92,7 @@ function saveCatalogFile(filePath, items) {
 /**
  * Splits and saves items across partition files strictly under 75 MB (~50,000 items each).
  */
-function saveCatalogPartitions(catalogDir, allItems) {
+export function saveCatalogPartitions(catalogDir, allItems) {
     const ITEMS_PER_PART = 50000;
     const numParts = Math.ceil(allItems.length / ITEMS_PER_PART) || 1;
 
@@ -101,7 +104,7 @@ function saveCatalogPartitions(catalogDir, allItems) {
         saveCatalogFile(partFile, partItems);
     }
 
-    // Delete single oversized file if it exists so git won't exceed GitHub's 100MB limit
+    // Delete single oversized legacy file if it exists so git won't exceed GitHub's 100MB limit
     const singleFile = path.join(catalogDir, 'javhd_catalog.json');
     if (fs.existsSync(singleFile)) {
         try { fs.unlinkSync(singleFile); } catch {}
@@ -157,10 +160,13 @@ export async function runIndexer() {
         }
     }
 
+    const failedPages = new Set(checkpoint.catalog?.failedPages || []);
+    let lastSuccessfulPage = checkpoint.catalog?.lastIndexedPage || 0;
+
     let currentPage = opts.startPage;
-    if (opts.resume && checkpoint.catalog?.lastIndexedPage && !opts.isTest) {
-        currentPage = checkpoint.catalog.lastIndexedPage + 1;
-        console.log(`[Indexer] 🔄 Resuming from page ${currentPage}`);
+    if (opts.resume && lastSuccessfulPage > 0 && !opts.isTest) {
+        currentPage = lastSuccessfulPage + 1;
+        console.log(`[Indexer] 🔄 Resuming from page ${currentPage} (last fully completed page was ${lastSuccessfulPage})`);
     }
 
     let totalPages = checkpoint.catalog?.totalPages || 13571;
@@ -176,11 +182,10 @@ export async function runIndexer() {
     console.log(`- Storage:    ${opts.isTest ? 'javhd_catalog_test.json' : 'Auto-partitioned (<75 MB)'}`);
     console.log(`======================================================\n`);
 
-    let consecutiveEmptyPages = 0;
     let pagesCrawled = 0;
     const startTime = Date.now();
 
-    // Graceful exit & auto-save handler
+    // Graceful exit & auto-save handler (saves ONLY actually successful page index!)
     const saveState = (isFinal = false) => {
         const allItems = Array.from(catalogMap.values());
         if (opts.isTest) {
@@ -192,9 +197,10 @@ export async function runIndexer() {
         if (!opts.isTest) {
             checkpoint.catalog = {
                 totalVideos: allItems.length,
-                lastIndexedPage: currentPage - 1,
+                lastIndexedPage: lastSuccessfulPage,
+                failedPages: Array.from(failedPages),
                 totalPages,
-                isComplete: isFinal && currentPage > totalPages,
+                isComplete: isFinal && currentPage > totalPages && failedPages.size === 0,
                 updatedAt: new Date().toISOString()
             };
             saveCheckpoint(checkpoint);
@@ -204,66 +210,77 @@ export async function runIndexer() {
     process.on('SIGINT', () => {
         console.log('\n\n💾 Interrupted! Saving catalog & checkpoint before exit...');
         saveState(false);
-        console.log('✅ Progress saved. You can resume anytime with: node src/indexer.js --resume\n');
+        console.log(`✅ Progress saved. Last completed page: ${lastSuccessfulPage}.`);
+        console.log(`Next resume will start at page ${lastSuccessfulPage + 1}.\n`);
         process.exit(0);
     });
 
     while (currentPage <= targetLimit) {
         const pageStart = Date.now();
+        let pageSuccess = false;
+        let retryAttempt = 0;
+        const MAX_RETRIES = 5;
 
-        try {
-            const data = await client.getCatalogPage(currentPage);
+        while (!pageSuccess && retryAttempt < MAX_RETRIES) {
+            try {
+                const data = await client.getCatalogPage(currentPage);
 
-            if (!data || !data.html) {
-                consecutiveEmptyPages++;
-                console.warn(`[Indexer] ⚠️ Page ${currentPage}: No HTML returned.`);
-                if (consecutiveEmptyPages >= 5) {
-                    console.log(`[Indexer] Reached 5 consecutive empty pages. Catalog crawl finished!`);
+                if (data && data.html) {
+                    // Update total pages from pagination metadata if present
+                    if (data.pagination) {
+                        const pag = parsePagination(data.pagination, totalPages);
+                        if (pag.totalPages > totalPages) {
+                            totalPages = pag.totalPages;
+                        }
+                    }
+
+                    const cards = parseVideoCards(data.html);
+
+                    let newOnPage = 0;
+                    for (const card of cards) {
+                        if (!catalogMap.has(String(card.id))) {
+                            catalogMap.set(String(card.id), card);
+                            newOnPage++;
+                        }
+                    }
+
+                    pagesCrawled++;
+                    lastSuccessfulPage = Math.max(lastSuccessfulPage, currentPage);
+                    failedPages.delete(currentPage);
+                    pageSuccess = true;
+
+                    const pageElapsed = ((Date.now() - pageStart) / 1000).toFixed(2);
+                    const totalElapsed = (Date.now() - startTime) / 1000;
+                    const avgSecPerPage = totalElapsed / pagesCrawled;
+                    const pagesRemaining = targetLimit - currentPage;
+                    const etaMins = Math.ceil((pagesRemaining * avgSecPerPage) / 60);
+                    const pct = (((currentPage) / targetLimit) * 100).toFixed(1);
+
+                    console.log(`[Page ${currentPage}/${targetLimit} (${pct}%)] ✅ +${cards.length} cards (${newOnPage} new, Total: ${catalogMap.size}) | ${pageElapsed}s | ETA: ~${etaMins}m`);
+
+                    // Periodic auto-save every 25 pages
+                    if (pagesCrawled % 25 === 0) {
+                        saveState(false);
+                    }
                     break;
+                } else {
+                    retryAttempt++;
+                    const waitSec = retryAttempt * 5;
+                    console.warn(`[Indexer] ⚠️ Page ${currentPage}: No data received (Cloudflare challenge / empty). Pausing ${waitSec}s (retry ${retryAttempt}/${MAX_RETRIES})...`);
+                    await new Promise(r => setTimeout(r, waitSec * 1000));
                 }
-                currentPage++;
-                continue;
+            } catch (err) {
+                retryAttempt++;
+                const waitSec = retryAttempt * 5;
+                console.warn(`[Indexer] ⚠️ Page ${currentPage} error: ${err.message}. Pausing ${waitSec}s (retry ${retryAttempt}/${MAX_RETRIES})...`);
+                await new Promise(r => setTimeout(r, waitSec * 1000));
             }
+        }
 
-            consecutiveEmptyPages = 0;
-
-            // Update total pages from pagination metadata if present
-            if (data.pagination) {
-                const pag = parsePagination(data.pagination, totalPages);
-                if (pag.totalPages > totalPages) {
-                    totalPages = pag.totalPages;
-                }
-            }
-
-            const cards = parseVideoCards(data.html);
-
-            let newOnPage = 0;
-            for (const card of cards) {
-                if (!catalogMap.has(String(card.id))) {
-                    catalogMap.set(String(card.id), card);
-                    newOnPage++;
-                }
-            }
-
-            pagesCrawled++;
-            const pageElapsed = ((Date.now() - pageStart) / 1000).toFixed(2);
-            const totalElapsed = (Date.now() - startTime) / 1000;
-            const avgSecPerPage = totalElapsed / pagesCrawled;
-            const pagesRemaining = targetLimit - currentPage;
-            const etaMins = Math.ceil((pagesRemaining * avgSecPerPage) / 60);
-            const pct = (((currentPage) / targetLimit) * 100).toFixed(1);
-
-            console.log(`[Page ${currentPage}/${targetLimit} (${pct}%)] ✅ +${cards.length} cards (${newOnPage} new, Total: ${catalogMap.size}) | ${pageElapsed}s | ETA: ~${etaMins}m`);
-
-            // Periodic auto-save every 25 pages
-            if (pagesCrawled % 25 === 0) {
-                saveState(false);
-            }
-
-        } catch (err) {
-            console.error(`[Indexer] ❌ Error on page ${currentPage}: ${err.message}`);
-            // Wait 2.5s breather so transient rate limit doesn't hammer subsequent requests
-            await new Promise(r => setTimeout(r, 2500));
+        // If page failed completely after all retries, record it so it won't be lost!
+        if (!pageSuccess) {
+            console.error(`[Indexer] ❌ Page ${currentPage} FAILED after ${MAX_RETRIES} attempts. Recorded in checkpoint failedPages.`);
+            failedPages.add(currentPage);
         }
 
         currentPage++;
@@ -279,6 +296,8 @@ export async function runIndexer() {
     console.log(`[Indexer] 🎉 Catalog Crawl Finished!`);
     console.log(`- Total Titles Indexed: ${catalogMap.size}`);
     console.log(`- Pages Crawled:        ${pagesCrawled}`);
+    console.log(`- Failed Pages:         ${failedPages.size}`);
+    console.log(`- Last Successful Page: ${lastSuccessfulPage}`);
     console.log(`- Total Elapsed:        ${totalSeconds}s (${speed} titles/sec)`);
     console.log(`======================================================\n`);
 }
