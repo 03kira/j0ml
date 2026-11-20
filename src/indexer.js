@@ -5,6 +5,7 @@
  * Automatically partitions output into <75 MB files (javhd_catalog_part1.json, etc.)
  * Resilient retry mechanism: NEVER skips failed pages without retrying, and only marks
  * truly completed pages in checkpoint.
+ * Automatically halts and enters 10-15m cooldown on Cloudflare rate limits.
  */
 
 import fs from 'node:fs';
@@ -15,7 +16,8 @@ import {
     CATALOG_DIR,
     CATALOG_FILE,
     CHECKPOINT_PATH,
-    DEFAULT_DELAY_MS
+    DEFAULT_DELAY_MS,
+    DEFAULT_COOLDOWN_MS
 } from './config.js';
 
 function parseArgs() {
@@ -25,7 +27,8 @@ function parseArgs() {
         maxPages: Infinity,
         startPage: 1,
         resume: false,
-        delayMs: DEFAULT_DELAY_MS
+        delayMs: DEFAULT_DELAY_MS,
+        cooldownMs: DEFAULT_COOLDOWN_MS
     };
 
     let explicitPages = false;
@@ -46,6 +49,12 @@ function parseArgs() {
             options.resume = true;
         } else if (args[i] === '--delay' && args[i + 1]) {
             options.delayMs = parseInt(args[i + 1], 10);
+            i++;
+        } else if (args[i] === '--cooldown' && args[i + 1]) {
+            const mins = parseFloat(args[i + 1]);
+            if (!isNaN(mins) && mins > 0) {
+                options.cooldownMs = mins * 60 * 1000;
+            }
             i++;
         }
     }
@@ -113,7 +122,7 @@ export function saveCatalogPartitions(catalogDir, allItems) {
 
 export async function runIndexer() {
     const opts = parseArgs();
-    const client = new HttpClient({ delayMs: opts.delayMs });
+    const client = new HttpClient({ delayMs: opts.delayMs, cooldownMs: opts.cooldownMs });
 
     if (!fs.existsSync(CATALOG_DIR)) {
         fs.mkdirSync(CATALOG_DIR, { recursive: true });
@@ -179,6 +188,7 @@ export async function runIndexer() {
     console.log(`- Start Page: ${currentPage}`);
     console.log(`- Max Pages:  ${opts.maxPages === Infinity ? 'All Available' : opts.maxPages}`);
     console.log(`- Delay:      ${opts.delayMs} ms`);
+    console.log(`- Cooldown:   ${(opts.cooldownMs / 60000).toFixed(1)} mins (on Cloudflare rate limit)`);
     console.log(`- Storage:    ${opts.isTest ? 'javhd_catalog_test.json' : 'Auto-partitioned (<75 MB)'}`);
     console.log(`======================================================\n`);
 
@@ -219,7 +229,7 @@ export async function runIndexer() {
         const pageStart = Date.now();
         let pageSuccess = false;
         let retryAttempt = 0;
-        const MAX_RETRIES = 5;
+        const MAX_RETRIES = 3;
 
         while (!pageSuccess && retryAttempt < MAX_RETRIES) {
             try {
@@ -266,10 +276,15 @@ export async function runIndexer() {
                 } else {
                     retryAttempt++;
                     const waitSec = retryAttempt * 5;
-                    console.warn(`[Indexer] ⚠️ Page ${currentPage}: No data received (Cloudflare challenge / empty). Pausing ${waitSec}s (retry ${retryAttempt}/${MAX_RETRIES})...`);
+                    console.warn(`[Indexer] ⚠️ Page ${currentPage}: Empty response. Pausing ${waitSec}s (retry ${retryAttempt}/${MAX_RETRIES})...`);
                     await new Promise(r => setTimeout(r, waitSec * 1000));
                 }
             } catch (err) {
+                // If Cloudflare persisted after full cooldowns, avoid rapid hammering
+                if (err.message && err.message.includes('Cloudflare challenge persisted')) {
+                    console.error(`[Indexer] 🛑 Persistent Cloudflare challenge on page ${currentPage}.`);
+                    break;
+                }
                 retryAttempt++;
                 const waitSec = retryAttempt * 5;
                 console.warn(`[Indexer] ⚠️ Page ${currentPage} error: ${err.message}. Pausing ${waitSec}s (retry ${retryAttempt}/${MAX_RETRIES})...`);

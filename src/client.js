@@ -9,17 +9,79 @@ import {
     DEFAULT_DELAY_MS,
     TIMEOUT_MS,
     MAX_RETRIES,
+    DEFAULT_COOLDOWN_MS,
     COOKIE_JAR_PATH
 } from './config.js';
 
 const execFileAsync = promisify(execFile);
 const CURL_BIN = process.platform === 'win32' ? 'curl.exe' : 'curl';
 
+/**
+ * Checks whether an HTTP response indicates a Cloudflare challenge or rate limit.
+ */
+export function isCloudflareChallenge(body = '', statusCode = 200) {
+    if (statusCode === 429) return true;
+    if (!body || typeof body !== 'string') return false;
+    const lower = body.toLowerCase();
+    if (statusCode === 403 || statusCode === 503) {
+        if (lower.includes('cloudflare') || lower.includes('cf-chl') || lower.includes('just a moment') || lower.includes('turnstile') || lower.includes('challenge-platform')) {
+            return true;
+        }
+    }
+    if (lower.includes('<!doctype html') || lower.includes('<html')) {
+        if (lower.includes('cf-chl') || lower.includes('challenge-platform') || lower.includes('just a moment...') || lower.includes('attention required! | cloudflare')) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/**
+ * Pauses execution for the specified duration while displaying a live countdown in the terminal.
+ */
+export async function sleepWithCountdown(durationMs, message = 'Cooldown in progress') {
+    const start = Date.now();
+    const end = start + durationMs;
+    const isTTY = Boolean(process.stdout.isTTY);
+
+    console.log(`\n======================================================`);
+    console.log(`[Cooldown] 🛑 PAUSE TRIGGERED: ${message}`);
+    console.log(`[Cooldown] ⏱️ Halting all requests for ${(durationMs / 60000).toFixed(1)} minutes.`);
+    console.log(`[Cooldown] 💡 Tip: You can press Ctrl+C anytime to safely save progress and exit.`);
+    console.log(`======================================================\n`);
+
+    while (Date.now() < end) {
+        const remainingMs = Math.max(0, end - Date.now());
+        const totalSec = Math.ceil(remainingMs / 1000);
+        const mins = Math.floor(totalSec / 60);
+        const secs = totalSec % 60;
+        const timeStr = `${mins}m ${secs < 10 ? '0' : ''}${secs}s`;
+
+        if (isTTY) {
+            process.stdout.write(`\r[Cooldown] ⏳ Remaining: ${timeStr} until requests resume...       `);
+        } else {
+            if (totalSec % 60 === 0 || remainingMs <= 5000) {
+                console.log(`[Cooldown] ⏳ Remaining: ${timeStr} until requests resume...`);
+            }
+        }
+
+        const step = Math.min(1000, remainingMs);
+        if (step <= 0) break;
+        await new Promise(r => setTimeout(r, step));
+    }
+
+    if (isTTY) {
+        process.stdout.write('\r[Cooldown] ⏳ 0m 00s remaining until requests resume...       \n');
+    }
+    console.log(`\n[Cooldown] ✅ Cooldown completed! Resuming crawler requests now...\n`);
+}
+
 export class HttpClient {
     constructor(options = {}) {
         this.delayMs = options.delayMs ?? DEFAULT_DELAY_MS;
         this.timeoutMs = options.timeoutMs ?? TIMEOUT_MS;
         this.maxRetries = options.maxRetries ?? MAX_RETRIES;
+        this.cooldownMs = options.cooldownMs ?? DEFAULT_COOLDOWN_MS;
         this.userAgent = options.userAgent || HEADERS['User-Agent'];
         this.headers = { ...HEADERS, ...(options.headers || {}) };
         this.lastRequestTime = 0;
@@ -38,6 +100,24 @@ export class HttpClient {
             await new Promise(resolve => setTimeout(resolve, this.delayMs - elapsed));
         }
         this.lastRequestTime = Date.now();
+    }
+
+    /**
+     * Halts all requests and enters a 10-15 minute cooldown to allow Cloudflare IP rate limits to reset.
+     */
+    async handleCooldown(url, reason = 'Cloudflare challenge / rate-limit detected') {
+        console.warn(`\n[Client] ⚠️ Cloudflare challenge / rate-limit triggered at: ${url}`);
+        console.warn(`[Client] 🛑 Stopping all requests immediately.`);
+
+        // Clear cookies to avoid reusing blocked challenge session tokens
+        if (this.cookieJarPath && fs.existsSync(this.cookieJarPath)) {
+            try {
+                fs.unlinkSync(this.cookieJarPath);
+                console.log(`[Client] 🧹 Cleared cookie jar (${path.basename(this.cookieJarPath)}) for a clean retry session.`);
+            } catch {}
+        }
+
+        await sleepWithCountdown(this.cooldownMs, reason);
     }
 
     /**
@@ -92,9 +172,12 @@ export class HttpClient {
                     if (statusCode === 404) return null;
 
                     if (statusCode === 429) {
-                        const waitMs = 3500 * attempt;
-                        console.warn(`[Client] Rate limited (429) on ${url}. Waiting ${waitMs / 1000}s...`);
-                        await new Promise(r => setTimeout(r, waitMs));
+                        await this.handleCooldown(url, `HTTP 429 Too Many Requests (attempt ${attempt}/${retries})`);
+                        continue;
+                    }
+
+                    if (isCloudflareChallenge(body, statusCode)) {
+                        await this.handleCooldown(url, `Cloudflare challenge detected (HTTP ${statusCode}, attempt ${attempt}/${retries})`);
                         continue;
                     }
 
@@ -121,7 +204,18 @@ export class HttpClient {
                         signal: AbortSignal.timeout(this.timeoutMs)
                     });
                     if (res.status === 404) return null;
-                    if (res.ok) return await res.text();
+                    if (res.status === 429) {
+                        await this.handleCooldown(url, `Fetch HTTP 429 Too Many Requests`);
+                        continue;
+                    }
+                    if (res.ok) {
+                        const text = await res.text();
+                        if (isCloudflareChallenge(text, res.status)) {
+                            await this.handleCooldown(url, `Fetch Cloudflare challenge detected`);
+                            continue;
+                        }
+                        return text;
+                    }
                 } catch (fetchErr) {
                     lastError = fetchErr;
                 }
@@ -137,10 +231,12 @@ export class HttpClient {
     }
 
     /**
-     * Fetches and parses a JSON endpoint with HTML / Cloudflare challenge detection & backoff.
+     * Fetches and parses a JSON endpoint with HTML / Cloudflare challenge detection & 10-15m backoff cooldown.
      */
-    async getJson(url, customHeaders = {}, retries = 3) {
-        for (let attempt = 1; attempt <= retries; attempt++) {
+    async getJson(url, customHeaders = {}, maxCooldownCycles = 2) {
+        let cooldownCycles = 0;
+
+        while (true) {
             const body = await this.get(url, {
                 'Accept': 'application/json, text/javascript, */*; q=0.01',
                 ...customHeaders
@@ -148,24 +244,29 @@ export class HttpClient {
             if (!body) return null;
 
             const trimmed = body.trim();
+
             // Check if Cloudflare or server returned HTML challenge page instead of JSON
-            if (trimmed.startsWith('<') || trimmed.includes('<!DOCTYPE')) {
-                const waitMs = 4000 * attempt;
-                console.warn(`[Client] ⚠️ Received HTML instead of JSON from ${url} (Cloudflare challenge / temporary rate limit). Pausing ${waitMs / 1000}s (attempt ${attempt}/${retries})...`);
-                await new Promise(r => setTimeout(r, waitMs));
-                continue;
+            if (trimmed.startsWith('<') || trimmed.includes('<!DOCTYPE') || trimmed.includes('<html')) {
+                if (cooldownCycles < maxCooldownCycles) {
+                    cooldownCycles++;
+                    console.warn(`\n[Client] ⚠️ Received HTML instead of JSON from ${url} (Cloudflare challenge / temporary rate limit).`);
+                    console.warn(`[Client] 🛑 Halting all requests immediately (Cooldown cycle ${cooldownCycles}/${maxCooldownCycles})...`);
+
+                    await this.handleCooldown(url, `Received HTML challenge page instead of JSON from ${url}`);
+
+                    console.log(`[Client] 🔄 Cooldown elapsed. Retrying JSON request to ${url}...`);
+                    continue;
+                } else {
+                    throw new Error(`Cloudflare challenge persisted at ${url} after ${cooldownCycles} cooldown cycle(s) (${((cooldownCycles * this.cooldownMs) / 60000).toFixed(0)} mins pause).`);
+                }
             }
 
             try {
                 return JSON.parse(body);
             } catch (e) {
-                if (attempt === retries) {
-                    throw new Error(`Failed to parse JSON response from ${url}: ${e.message}`);
-                }
-                await new Promise(r => setTimeout(r, 2000 * attempt));
+                throw new Error(`Failed to parse JSON response from ${url}: ${e.message}`);
             }
         }
-        return null;
     }
 
     /**
@@ -181,14 +282,19 @@ export class HttpClient {
         // Try primary AJAX endpoint: /releaseday/?ajax=browse_videos&page=N
         const urlA = `${RELEASEDAY_URL}?ajax=browse_videos&page=${page}`;
         try {
-            const data = await this.getJson(urlA, headers, 2);
+            const data = await this.getJson(urlA, headers);
             if (data && data.html) return data;
-        } catch {}
+        } catch (err) {
+            if (err.message && err.message.includes('Cloudflare challenge persisted')) {
+                throw err;
+            }
+            console.warn(`[Client] Primary endpoint error on page ${page}: ${err.message}. Trying fallback...`);
+        }
 
         // Fallback to path-based AJAX endpoint: /releaseday/N/?ajax=browse_videos&page=N
         if (page > 1) {
             const urlB = `${RELEASEDAY_URL}${page}/?ajax=browse_videos&page=${page}`;
-            return await this.getJson(urlB, headers, 3);
+            return await this.getJson(urlB, headers);
         }
 
         return null;

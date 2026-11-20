@@ -37,3 +37,8 @@ export const MAX_CATALOG_PART_BYTES = 75 * 1024 * 1024;
 export const DEFAULT_DELAY_MS = 350;
 export const TIMEOUT_MS = 25000;
 export const MAX_RETRIES = 3;
+
+// Cloudflare challenge cooldown duration: default 12 minutes (10-15 mins range)
+export const DEFAULT_COOLDOWN_MS = (process.env.CLOUDFLARE_COOLDOWN_MINS 
+    ? parseFloat(process.env.CLOUDFLARE_COOLDOWN_MINS) 
+    : 12) * 60 * 1000;

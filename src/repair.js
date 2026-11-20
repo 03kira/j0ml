@@ -2,6 +2,7 @@
  * JAVHD.today Catalog Gap Repair Tool
  * Recovers missing pages that were skipped during transient Cloudflare challenge blocks.
  * Automatically inserts missing titles into partitioned catalog storage.
+ * Halts and pauses for 10-15m when encountering Cloudflare rate limits.
  */
 
 import fs from 'node:fs';
@@ -12,7 +13,8 @@ import { saveCatalogPartitions } from './indexer.js';
 import {
     CATALOG_DIR,
     CHECKPOINT_PATH,
-    DEFAULT_DELAY_MS
+    DEFAULT_DELAY_MS,
+    DEFAULT_COOLDOWN_MS
 } from './config.js';
 
 // Pre-identified gap ranges where earlier crawls were interrupted by Cloudflare blocks
@@ -29,6 +31,7 @@ function parseArgs() {
     const options = {
         customRanges: [],
         delayMs: DEFAULT_DELAY_MS,
+        cooldownMs: DEFAULT_COOLDOWN_MS,
         maxPages: Infinity
     };
 
@@ -48,6 +51,12 @@ function parseArgs() {
         } else if (args[i] === '--delay' && args[i + 1]) {
             options.delayMs = parseInt(args[i + 1], 10);
             i++;
+        } else if (args[i] === '--cooldown' && args[i + 1]) {
+            const mins = parseFloat(args[i + 1]);
+            if (!isNaN(mins) && mins > 0) {
+                options.cooldownMs = mins * 60 * 1000;
+            }
+            i++;
         } else if (args[i] === '--max' && args[i + 1]) {
             options.maxPages = parseInt(args[i + 1], 10);
             i++;
@@ -63,7 +72,7 @@ function parseArgs() {
 
 export async function runRepair() {
     const opts = parseArgs();
-    const client = new HttpClient({ delayMs: opts.delayMs });
+    const client = new HttpClient({ delayMs: opts.delayMs, cooldownMs: opts.cooldownMs });
 
     // 1. Load all existing catalog items
     const catalogMap = new Map();
@@ -87,6 +96,7 @@ export async function runRepair() {
     console.log(`======================================================`);
     console.log(`- Loaded Catalog Titles: ${initialCount} across ${files.length} partition(s)`);
     console.log(`- Delay:                 ${opts.delayMs} ms`);
+    console.log(`- Cooldown:              ${(opts.cooldownMs / 60000).toFixed(1)} mins (on Cloudflare rate limit)`);
     console.log(`- Ranges to Inspect:     ${opts.customRanges.map(r => `${r.start}-${r.end}`).join(', ')}`);
     console.log(`======================================================\n`);
 
@@ -125,7 +135,7 @@ export async function runRepair() {
 
             let pageSuccess = false;
             let retryAttempt = 0;
-            const MAX_RETRIES = 4;
+            const MAX_RETRIES = 3;
 
             while (!pageSuccess && retryAttempt < MAX_RETRIES) {
                 try {
@@ -155,10 +165,14 @@ export async function runRepair() {
                     } else {
                         retryAttempt++;
                         const waitSec = retryAttempt * 4;
-                        console.warn(`  [Page ${p}] ⚠️ Empty / challenge response. Waiting ${waitSec}s (retry ${retryAttempt}/${MAX_RETRIES})...`);
+                        console.warn(`  [Page ${p}] ⚠️ Empty response. Waiting ${waitSec}s (retry ${retryAttempt}/${MAX_RETRIES})...`);
                         await new Promise(r => setTimeout(r, waitSec * 1000));
                     }
                 } catch (err) {
+                    if (err.message && err.message.includes('Cloudflare challenge persisted')) {
+                        console.error(`  [Page ${p}] 🛑 Cloudflare challenge persisted after cooldown.`);
+                        break;
+                    }
                     retryAttempt++;
                     const waitSec = retryAttempt * 4;
                     console.warn(`  [Page ${p}] ⚠️ Error: ${err.message}. Waiting ${waitSec}s (retry ${retryAttempt}/${MAX_RETRIES})...`);

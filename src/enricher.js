@@ -2,6 +2,7 @@
  * JAVHD.today Detail Enrichment Engine
  * Reads indexed catalog, fetches full video details & streaming server embeds,
  * and writes to partitioned JSON files (split at 85 MB to stay strictly under GitHub's 100 MB limit).
+ * Halts and pauses for 10-15m on Cloudflare challenge or rate limits.
  */
 
 import fs from 'node:fs';
@@ -14,6 +15,7 @@ import {
     CATALOG_DIR,
     CHECKPOINT_PATH,
     DEFAULT_DELAY_MS,
+    DEFAULT_COOLDOWN_MS,
     BASE_URL
 } from './config.js';
 
@@ -24,6 +26,7 @@ function parseArgs() {
         limit: Infinity,
         batchSize: Infinity,
         delayMs: DEFAULT_DELAY_MS,
+        cooldownMs: DEFAULT_COOLDOWN_MS,
         maxMinutes: 270, // 4.5 hours safe cutoff for GitHub Actions
         maxPartMb: 85,
         targetId: null,
@@ -44,6 +47,12 @@ function parseArgs() {
             i++;
         } else if (args[i] === '--delay' && args[i + 1]) {
             options.delayMs = parseInt(args[i + 1], 10);
+            i++;
+        } else if (args[i] === '--cooldown' && args[i + 1]) {
+            const mins = parseFloat(args[i + 1]);
+            if (!isNaN(mins) && mins > 0) {
+                options.cooldownMs = mins * 60 * 1000;
+            }
             i++;
         } else if (args[i] === '--max-minutes' && args[i + 1]) {
             options.maxMinutes = parseFloat(args[i + 1]);
@@ -137,7 +146,7 @@ export function loadAllCatalogItems(isTest = false) {
 
 export async function runEnricher() {
     const opts = parseArgs();
-    const client = new HttpClient({ delayMs: opts.delayMs });
+    const client = new HttpClient({ delayMs: opts.delayMs, cooldownMs: opts.cooldownMs });
     const maxPartSizeBytes = opts.maxPartMb * 1024 * 1024;
     const partitionManager = new PartitionManager(undefined, maxPartSizeBytes);
     const checkpoint = loadCheckpoint();
@@ -218,6 +227,7 @@ export async function runEnricher() {
     console.log(`- Mode:       ${opts.isTest ? 'TEST (5 items)' : 'PRODUCTION'}`);
     console.log(`- Batch Size: ${maxToProcess}`);
     console.log(`- Delay:      ${opts.delayMs} ms`);
+    console.log(`- Cooldown:   ${(opts.cooldownMs / 60000).toFixed(1)} mins (on Cloudflare rate limit)`);
     console.log(`- Timeout:    ${opts.maxMinutes} mins`);
     console.log(`- Max Part:   ${opts.maxPartMb} MB`);
     console.log(`======================================================\n`);
@@ -270,36 +280,31 @@ export async function runEnricher() {
                     if (relRes.status === 'fulfilled') relatedJson = relRes.value;
                 } catch {}
 
-                const detail = parseVideoDetail(html, pageUrl, item, {
+                const enriched = parseVideoDetail(html, pageUrl, item, {
                     downloadHtml,
                     relatedHtml: relatedJson?.html
                 });
 
-                if (detail && detail.id) {
-                    partitionManager.add(detail);
-                    successCount++;
+                partitionManager.add(enriched);
+                delete checkpoint.enrichment.failedItems[String(identifier)];
+                successCount++;
 
-                    const pct = (((processedCount + 1) / maxToProcess) * 100).toFixed(1);
-                    const codeDisplay = detail.code ? `[${detail.code}]` : '';
-                    const serversCount = detail.servers ? detail.servers.length : 0;
-                    const dlCount = detail.downloads ? detail.downloads.length : 0;
-                    const relCount = detail.related_videos ? detail.related_videos.length : 0;
-                    const dateDisplay = detail.release_date || 'N/A';
-                    console.log(`[${processedCount + 1}/${maxToProcess} (${pct}%)] ✅ ${codeDisplay} "${detail.title.slice(0, 32)}..." | ${serversCount} streams | ${dlCount} dl | ${relCount} rel | ${dateDisplay}`);
-                } else {
-                    console.warn(`[Enricher] ⚠️ Video #${item.id}: Parser returned null.`);
-                    failedCount++;
-                }
+                const code = enriched.code || 'NO-CODE';
+                const serversCount = (enriched.streams?.embed_sources || []).length;
+                const dlCount = (enriched.streams?.download_sources || []).length;
+                const relCount = (enriched.related_videos || []).length;
+
+                console.log(`[${processedCount + 1}/${maxToProcess}] ✅ Enriched #${item.id} [${code}]: "${enriched.title?.slice(0, 35)}..." (${serversCount} embeds, ${dlCount} dl, ${relCount} rel)`);
             }
         } catch (err) {
-            console.error(`[Enricher] ❌ Error on #${item.id} (${item.code || 'NO-CODE'}): ${err.message}`);
+            console.error(`[Enricher] ❌ Error on video #${item.id}: ${err.message}`);
             checkpoint.enrichment.failedItems[String(identifier)] = err.message;
             failedCount++;
         }
 
         processedCount++;
 
-        // Periodic flush every 25 items
+        // Periodic checkpoint every 25 items
         if (processedCount % 25 === 0) {
             partitionManager.flush();
             checkpoint.enrichment.totalEnriched = partitionManager.allIds.size;
@@ -308,29 +313,26 @@ export async function runEnricher() {
         }
     }
 
-    // Final flush
+    // Final flush & save
     partitionManager.flush();
     checkpoint.enrichment.totalEnriched = partitionManager.allIds.size;
     checkpoint.enrichment.lastUpdated = new Date().toISOString();
     saveCheckpoint(checkpoint);
 
-    const elapsedSec = ((Date.now() - startTime) / 1000).toFixed(1);
-    const speed = elapsedSec > 0 ? (processedCount / elapsedSec).toFixed(2) : 0;
-    const stats = partitionManager.getStats();
+    const totalSec = ((Date.now() - startTime) / 1000).toFixed(1);
+    const avgRate = totalSec > 0 ? (processedCount / totalSec).toFixed(2) : 0;
 
     console.log(`\n======================================================`);
-    console.log(`[Enricher] 🎉 Enrichment Run Finished!`);
-    console.log(`- Processed:    ${processedCount} titles (${successCount} succeeded, ${failedCount} failed)`);
-    console.log(`- Total in DB:  ${stats.totalItems}`);
-    console.log(`- Partitions:   ${stats.totalParts} active file(s) (Total: ${stats.totalSizeMB} MB)`);
-    for (const p of stats.partsSummary) {
-        console.log(`  * ${p.file}: ${p.items} items, ${p.sizeMB} MB`);
-    }
-    console.log(`- Speed:        ${speed} titles/sec (${elapsedSec}s elapsed)`);
+    console.log(`[Enricher] 🎉 Batch Completed!`);
+    console.log(`- Processed Items:  ${processedCount}`);
+    console.log(`- Success:          ${successCount}`);
+    console.log(`- Failed / Skipped: ${failedCount}`);
+    console.log(`- Total Enriched:   ${partitionManager.allIds.size}`);
+    console.log(`- Total Partitions: ${partitionManager.partitions.length}`);
+    console.log(`- Elapsed:          ${totalSec}s (${avgRate} items/sec)`);
     console.log(`======================================================\n`);
 }
 
-// Auto-run if executed directly via CLI
 if (process.argv[1] && process.argv[1].endsWith('enricher.js')) {
     runEnricher().catch(err => {
         console.error('[Enricher] Fatal error:', err);
