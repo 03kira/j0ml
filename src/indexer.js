@@ -2,6 +2,7 @@
  * JAVHD.today Catalog Indexer
  * Crawls https://javhd.today/releaseday/?ajax=browse_videos&page={p}
  * Builds the complete deduplicated catalog with basic metadata (~380,000 items)
+ * Automatically partitions output into <75 MB files (javhd_catalog_part1.json, etc.)
  */
 
 import fs from 'node:fs';
@@ -60,7 +61,7 @@ function loadCheckpoint() {
         catalog: {
             totalVideos: 0,
             lastIndexedPage: 0,
-            totalPages: 13569,
+            totalPages: 13571,
             isComplete: false,
             updatedAt: null
         }
@@ -85,6 +86,28 @@ function saveCatalogFile(filePath, items) {
     fs.renameSync(tempPath, filePath);
 }
 
+/**
+ * Splits and saves items across partition files strictly under 75 MB (~50,000 items each).
+ */
+function saveCatalogPartitions(catalogDir, allItems) {
+    const ITEMS_PER_PART = 50000;
+    const numParts = Math.ceil(allItems.length / ITEMS_PER_PART) || 1;
+
+    for (let p = 1; p <= numParts; p++) {
+        const start = (p - 1) * ITEMS_PER_PART;
+        const end = Math.min(start + ITEMS_PER_PART, allItems.length);
+        const partItems = allItems.slice(start, end);
+        const partFile = path.join(catalogDir, `javhd_catalog_part${p}.json`);
+        saveCatalogFile(partFile, partItems);
+    }
+
+    // Delete single oversized file if it exists so git won't exceed GitHub's 100MB limit
+    const singleFile = path.join(catalogDir, 'javhd_catalog.json');
+    if (fs.existsSync(singleFile)) {
+        try { fs.unlinkSync(singleFile); } catch {}
+    }
+}
+
 export async function runIndexer() {
     const opts = parseArgs();
     const client = new HttpClient({ delayMs: opts.delayMs });
@@ -94,25 +117,43 @@ export async function runIndexer() {
     }
 
     const checkpoint = loadCheckpoint();
-    const outputFile = opts.isTest 
-        ? path.join(CATALOG_DIR, 'javhd_catalog_test.json') 
-        : CATALOG_FILE;
+    const testOutputFile = path.join(CATALOG_DIR, 'javhd_catalog_test.json');
 
-    // Load existing catalog items if file exists
+    // Load existing catalog items from test file, partitioned files, or legacy single file
     const catalogMap = new Map();
-    if (fs.existsSync(outputFile)) {
-        try {
-            const existing = JSON.parse(fs.readFileSync(outputFile, 'utf8'));
-            if (Array.isArray(existing)) {
-                for (const item of existing) {
-                    if (item && item.id) {
-                        catalogMap.set(String(item.id), item);
-                    }
+    if (opts.isTest) {
+        if (fs.existsSync(testOutputFile)) {
+            try {
+                const existing = JSON.parse(fs.readFileSync(testOutputFile, 'utf8'));
+                if (Array.isArray(existing)) {
+                    for (const item of existing) if (item && item.id) catalogMap.set(String(item.id), item);
                 }
-                console.log(`[Indexer] 📂 Loaded ${catalogMap.size} existing items from ${path.basename(outputFile)}`);
+            } catch {}
+        }
+    } else {
+        const files = fs.readdirSync(CATALOG_DIR);
+        const partFiles = files
+            .filter(f => /^javhd_catalog_part\d+\.json$/.test(f))
+            .sort((a, b) => parseInt(a.match(/\d+/)[0], 10) - parseInt(b.match(/\d+/)[0], 10));
+
+        if (partFiles.length > 0) {
+            for (const pf of partFiles) {
+                try {
+                    const items = JSON.parse(fs.readFileSync(path.join(CATALOG_DIR, pf), 'utf8'));
+                    if (Array.isArray(items)) {
+                        for (const item of items) if (item && item.id) catalogMap.set(String(item.id), item);
+                    }
+                } catch {}
             }
-        } catch (e) {
-            console.warn(`[Indexer] Could not read existing catalog: ${e.message}`);
+            console.log(`[Indexer] 📂 Loaded ${catalogMap.size} existing items across ${partFiles.length} catalog partition(s)`);
+        } else if (fs.existsSync(CATALOG_FILE)) {
+            try {
+                const existing = JSON.parse(fs.readFileSync(CATALOG_FILE, 'utf8'));
+                if (Array.isArray(existing)) {
+                    for (const item of existing) if (item && item.id) catalogMap.set(String(item.id), item);
+                }
+                console.log(`[Indexer] 📂 Loaded ${catalogMap.size} existing items from ${path.basename(CATALOG_FILE)}`);
+            } catch {}
         }
     }
 
@@ -122,6 +163,9 @@ export async function runIndexer() {
         console.log(`[Indexer] 🔄 Resuming from page ${currentPage}`);
     }
 
+    let totalPages = checkpoint.catalog?.totalPages || 13571;
+    const targetLimit = opts.maxPages === Infinity ? totalPages : Math.min(totalPages, currentPage + opts.maxPages - 1);
+
     console.log(`\n======================================================`);
     console.log(`        🚀 JAVHD.TODAY CATALOG INDEXER               `);
     console.log(`======================================================`);
@@ -129,18 +173,21 @@ export async function runIndexer() {
     console.log(`- Start Page: ${currentPage}`);
     console.log(`- Max Pages:  ${opts.maxPages === Infinity ? 'All Available' : opts.maxPages}`);
     console.log(`- Delay:      ${opts.delayMs} ms`);
-    console.log(`- Output:     ${path.basename(outputFile)}`);
+    console.log(`- Storage:    ${opts.isTest ? 'javhd_catalog_test.json' : 'Auto-partitioned (<75 MB)'}`);
     console.log(`======================================================\n`);
 
-    let totalPages = checkpoint.catalog?.totalPages || 13569;
     let consecutiveEmptyPages = 0;
     let pagesCrawled = 0;
     const startTime = Date.now();
 
-    // Graceful exit handler
+    // Graceful exit & auto-save handler
     const saveState = (isFinal = false) => {
         const allItems = Array.from(catalogMap.values());
-        saveCatalogFile(outputFile, allItems);
+        if (opts.isTest) {
+            saveCatalogFile(testOutputFile, allItems);
+        } else {
+            saveCatalogPartitions(CATALOG_DIR, allItems);
+        }
 
         if (!opts.isTest) {
             checkpoint.catalog = {
@@ -160,8 +207,6 @@ export async function runIndexer() {
         console.log('✅ Progress saved. You can resume anytime with: node src/indexer.js --resume\n');
         process.exit(0);
     });
-
-    const targetLimit = opts.maxPages === Infinity ? totalPages : Math.min(totalPages, currentPage + opts.maxPages - 1);
 
     while (currentPage <= targetLimit) {
         const pageStart = Date.now();
@@ -217,6 +262,8 @@ export async function runIndexer() {
 
         } catch (err) {
             console.error(`[Indexer] ❌ Error on page ${currentPage}: ${err.message}`);
+            // Wait 2.5s breather so transient rate limit doesn't hammer subsequent requests
+            await new Promise(r => setTimeout(r, 2500));
         }
 
         currentPage++;
@@ -227,15 +274,12 @@ export async function runIndexer() {
 
     const totalSeconds = ((Date.now() - startTime) / 1000).toFixed(1);
     const speed = totalSeconds > 0 ? (catalogMap.size / totalSeconds).toFixed(1) : 0;
-    const finalSizeMb = (fs.statSync(outputFile).size / (1024 * 1024)).toFixed(2);
 
     console.log(`\n======================================================`);
     console.log(`[Indexer] 🎉 Catalog Crawl Finished!`);
     console.log(`- Total Titles Indexed: ${catalogMap.size}`);
     console.log(`- Pages Crawled:        ${pagesCrawled}`);
-    console.log(`- Catalog File Size:    ${finalSizeMb} MB`);
     console.log(`- Total Elapsed:        ${totalSeconds}s (${speed} titles/sec)`);
-    console.log(`- File Saved:           ${outputFile}`);
     console.log(`======================================================\n`);
 }
 

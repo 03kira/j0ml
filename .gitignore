@@ -1,5 +1,7 @@
 node_modules/
 *.log
 *.tmp
+cookies.txt
+data/cookies.txt
 .DS_Store
 Thumbs.db

@@ -10,6 +10,7 @@ export const CATALOG_DIR = path.join(DATA_DIR, 'catalog');
 export const ENRICHED_DIR = path.join(DATA_DIR, 'enriched');
 export const CHECKPOINT_PATH = path.join(DATA_DIR, 'checkpoint.json');
 export const CATALOG_FILE = path.join(CATALOG_DIR, 'javhd_catalog.json');
+export const COOKIE_JAR_PATH = path.join(DATA_DIR, 'cookies.txt');
 
 export const BASE_URL = 'https://javhd.today';
 export const RELEASEDAY_URL = `${BASE_URL}/releaseday/`;
@@ -33,6 +34,6 @@ export const MAX_PART_SIZE_BYTES = 85 * 1024 * 1024;
 export const MAX_CATALOG_PART_BYTES = 75 * 1024 * 1024;
 
 // Rate limiting & network timeouts
-export const DEFAULT_DELAY_MS = 200;
+export const DEFAULT_DELAY_MS = 350;
 export const TIMEOUT_MS = 25000;
 export const MAX_RETRIES = 3;

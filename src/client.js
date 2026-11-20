@@ -1,3 +1,5 @@
+import fs from 'node:fs';
+import path from 'node:path';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import {
@@ -6,7 +8,8 @@ import {
     HEADERS,
     DEFAULT_DELAY_MS,
     TIMEOUT_MS,
-    MAX_RETRIES
+    MAX_RETRIES,
+    COOKIE_JAR_PATH
 } from './config.js';
 
 const execFileAsync = promisify(execFile);
@@ -20,6 +23,12 @@ export class HttpClient {
         this.userAgent = options.userAgent || HEADERS['User-Agent'];
         this.headers = { ...HEADERS, ...(options.headers || {}) };
         this.lastRequestTime = 0;
+        this.cookieJarPath = options.cookieJarPath || COOKIE_JAR_PATH;
+
+        if (this.cookieJarPath) {
+            const dir = path.dirname(this.cookieJarPath);
+            if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+        }
     }
 
     async throttle() {
@@ -32,7 +41,7 @@ export class HttpClient {
     }
 
     /**
-     * Executes HTTP GET using system curl with retry logic and full header emulation.
+     * Executes HTTP GET using system curl with retry logic, cookie jar, and full header emulation.
      */
     async get(url, customHeaders = {}, retries = this.maxRetries) {
         const timeoutSec = Math.max(5, Math.ceil(this.timeoutMs / 1000));
@@ -46,6 +55,11 @@ export class HttpClient {
             }
         }
 
+        const cookieArgs = [];
+        if (this.cookieJarPath) {
+            cookieArgs.push('-c', this.cookieJarPath, '-b', this.cookieJarPath);
+        }
+
         for (let attempt = 1; attempt <= retries; attempt++) {
             await this.throttle();
 
@@ -55,6 +69,7 @@ export class HttpClient {
                     '-sL',
                     '--compressed',
                     '--max-time', String(timeoutSec),
+                    ...cookieArgs,
                     '-w', '\n__HTTP_STATUS__:%{http_code}',
                     '-A', effectiveHeaders['User-Agent'] || this.userAgent,
                     ...headerArgs,
@@ -77,14 +92,14 @@ export class HttpClient {
                     if (statusCode === 404) return null;
 
                     if (statusCode === 429) {
-                        const waitMs = 3000 * attempt;
+                        const waitMs = 3500 * attempt;
                         console.warn(`[Client] Rate limited (429) on ${url}. Waiting ${waitMs / 1000}s...`);
                         await new Promise(r => setTimeout(r, waitMs));
                         continue;
                     }
 
                     if (statusCode >= 500) {
-                        const waitMs = 2000 * attempt;
+                        const waitMs = 3000 * attempt;
                         console.warn(`[Client] Server error (${statusCode}) on ${url}. Waiting ${waitMs / 1000}s...`);
                         await new Promise(r => setTimeout(r, waitMs));
                         continue;
@@ -115,31 +130,68 @@ export class HttpClient {
             if (attempt === retries) {
                 throw new Error(`Failed to GET ${url} after ${retries} attempts: ${lastError?.message || 'Unknown error'}`);
             }
-            await new Promise(r => setTimeout(r, 1000 * attempt));
+            await new Promise(r => setTimeout(r, 1500 * attempt));
         }
 
         return null;
     }
 
     /**
-     * Fetches and parses a JSON endpoint.
+     * Fetches and parses a JSON endpoint with HTML / Cloudflare challenge detection & backoff.
      */
-    async getJson(url, customHeaders = {}) {
-        const body = await this.get(url, customHeaders);
-        if (!body) return null;
-        try {
-            return JSON.parse(body);
-        } catch (e) {
-            throw new Error(`Failed to parse JSON response from ${url}: ${e.message}`);
+    async getJson(url, customHeaders = {}, retries = 3) {
+        for (let attempt = 1; attempt <= retries; attempt++) {
+            const body = await this.get(url, {
+                'Accept': 'application/json, text/javascript, */*; q=0.01',
+                ...customHeaders
+            });
+            if (!body) return null;
+
+            const trimmed = body.trim();
+            // Check if Cloudflare or server returned HTML challenge page instead of JSON
+            if (trimmed.startsWith('<') || trimmed.includes('<!DOCTYPE')) {
+                const waitMs = 4000 * attempt;
+                console.warn(`[Client] ⚠️ Received HTML instead of JSON from ${url} (Cloudflare challenge / temporary rate limit). Pausing ${waitMs / 1000}s (attempt ${attempt}/${retries})...`);
+                await new Promise(r => setTimeout(r, waitMs));
+                continue;
+            }
+
+            try {
+                return JSON.parse(body);
+            } catch (e) {
+                if (attempt === retries) {
+                    throw new Error(`Failed to parse JSON response from ${url}: ${e.message}`);
+                }
+                await new Promise(r => setTimeout(r, 2000 * attempt));
+            }
         }
+        return null;
     }
 
     /**
-     * Fetches releaseday catalog page JSON.
+     * Fetches releaseday catalog page JSON with automatic format fallback and proper AJAX headers.
      */
     async getCatalogPage(page = 1) {
-        const url = `${RELEASEDAY_URL}?ajax=browse_videos&page=${page}`;
-        return await this.getJson(url);
+        const headers = {
+            'Accept': 'application/json, text/javascript, */*; q=0.01',
+            'X-Requested-With': 'XMLHttpRequest',
+            'Referer': page > 1 ? `${RELEASEDAY_URL}${page}/` : RELEASEDAY_URL
+        };
+
+        // Try primary AJAX endpoint: /releaseday/?ajax=browse_videos&page=N
+        const urlA = `${RELEASEDAY_URL}?ajax=browse_videos&page=${page}`;
+        try {
+            const data = await this.getJson(urlA, headers, 2);
+            if (data && data.html) return data;
+        } catch {}
+
+        // Fallback to path-based AJAX endpoint: /releaseday/N/?ajax=browse_videos&page=N
+        if (page > 1) {
+            const urlB = `${RELEASEDAY_URL}${page}/?ajax=browse_videos&page=${page}`;
+            return await this.getJson(urlB, headers, 3);
+        }
+
+        return null;
     }
 
     /**

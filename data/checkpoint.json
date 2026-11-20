@@ -1,5 +1,11 @@
 {
-  "catalog": {},
+  "catalog": {
+    "totalVideos": 175132,
+    "lastIndexedPage": 8404,
+    "totalPages": 13571,
+    "isComplete": false,
+    "updatedAt": "2026-11-20T12:53:27.191Z"
+  },
   "enrichment": {
     "totalEnriched": 10,
     "failedItems": {},
