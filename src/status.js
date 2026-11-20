@@ -24,7 +24,7 @@ export function runStatus() {
     if (fs.existsSync(CATALOG_DIR)) {
         const files = fs.readdirSync(CATALOG_DIR);
         const partFiles = files
-            .filter(f => /^jav_catalog(?:_part\d+)?\.json$/.test(f))
+            .filter(f => /^javhd_catalog(?:_part\d+)?\.json$/.test(f))
             .sort();
 
         for (const f of partFiles) {
@@ -64,7 +64,7 @@ export function runStatus() {
         console.log(`  - HD Videos: ${hdCount} (${catalogItems.length > 0 ? ((hdCount / catalogItems.length) * 100).toFixed(1) : 0}%)`);
         if (topCodes) console.log(`  - Top Labels: ${topCodes}`);
     } else {
-        const testPath = path.join(CATALOG_DIR, 'jav_catalog_test.json');
+        const testPath = path.join(CATALOG_DIR, 'javhd_catalog_test.json');
         if (fs.existsSync(testPath)) {
             const stat = fs.statSync(testPath);
             const arr = JSON.parse(fs.readFileSync(testPath, 'utf8'));
@@ -84,7 +84,7 @@ export function runStatus() {
     const partFiles = [];
 
     if (fs.existsSync(ENRICHED_DIR)) {
-        const files = fs.readdirSync(ENRICHED_DIR).filter(f => /^jav_enriched_part\d+\.json$/.test(f));
+        const files = fs.readdirSync(ENRICHED_DIR).filter(f => /^javhd_enriched_part\d+\.json$/.test(f));
         files.sort((a, b) => {
             const numA = parseInt(a.match(/\d+/)[0], 10);
             const numB = parseInt(b.match(/\d+/)[0], 10);

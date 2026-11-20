@@ -82,8 +82,8 @@ jobs:
             echo "Sleeping 300s (5 minutes) cooldown to avoid rate limits..."
             sleep 300
 
-            echo "🚀 Triggering next JAV enrichment run..."
-            gh workflow run jav_enrich.yml \
+            echo "🚀 Triggering next JAVHD enrichment run..."
+            gh workflow run javhd_enrich.yml \
               -f limit="${{ github.event.inputs.limit || '0' }}" \
               -f max_minutes="${{ github.event.inputs.max_minutes || '270' }}" \
               -f max_part_mb="${{ github.event.inputs.max_part_mb || '85' }}" \

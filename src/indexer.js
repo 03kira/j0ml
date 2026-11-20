@@ -95,7 +95,7 @@ export async function runIndexer() {
 
     const checkpoint = loadCheckpoint();
     const outputFile = opts.isTest 
-        ? path.join(CATALOG_DIR, 'jav_catalog_test.json') 
+        ? path.join(CATALOG_DIR, 'javhd_catalog_test.json') 
         : CATALOG_FILE;
 
     // Load existing catalog items if file exists

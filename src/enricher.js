@@ -93,7 +93,7 @@ function saveCheckpoint(state) {
  */
 export function loadAllCatalogItems(isTest = false) {
     if (isTest) {
-        const testPath = path.join(CATALOG_DIR, 'jav_catalog_test.json');
+        const testPath = path.join(CATALOG_DIR, 'javhd_catalog_test.json');
         if (fs.existsSync(testPath)) {
             return JSON.parse(fs.readFileSync(testPath, 'utf8'));
         }
@@ -103,7 +103,7 @@ export function loadAllCatalogItems(isTest = false) {
 
     const files = fs.readdirSync(CATALOG_DIR);
     const partFiles = files
-        .filter(f => /^jav_catalog_part\d+\.json$/.test(f))
+        .filter(f => /^javhd_catalog_part\d+\.json$/.test(f))
         .sort((a, b) => {
             const numA = parseInt(a.match(/\d+/)[0], 10);
             const numB = parseInt(b.match(/\d+/)[0], 10);

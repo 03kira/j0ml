@@ -38,7 +38,7 @@ export class PartitionManager {
         }
 
         const files = fs.readdirSync(this.enrichedDir);
-        const partRegex = /^jav_enriched_part(\d+)\.json$/;
+        const partRegex = /^javhd_enriched_part(\d+)\.json$/;
         const partFiles = [];
 
         for (const f of files) {
@@ -51,7 +51,7 @@ export class PartitionManager {
         partFiles.sort((a, b) => a.partNum - b.partNum);
 
         if (partFiles.length === 0) {
-            const initialPath = path.join(this.enrichedDir, 'jav_enriched_part1.json');
+            const initialPath = path.join(this.enrichedDir, 'javhd_enriched_part1.json');
             const p = new EnrichedPart(initialPath, 1, []);
             this.parts.push(p);
             this.activePart = p;
@@ -107,7 +107,7 @@ export class PartitionManager {
 
     _rotateNewPart() {
         const nextNum = this.parts.length + 1;
-        const nextPath = path.join(this.enrichedDir, `jav_enriched_part${nextNum}.json`);
+        const nextPath = path.join(this.enrichedDir, `javhd_enriched_part${nextNum}.json`);
         console.log(`[PartitionManager] 📦 Active partition reached limit (${(this.activePart.size / (1024 * 1024)).toFixed(1)} MB). Creating ${path.basename(nextPath)}`);
         const newPart = new EnrichedPart(nextPath, nextNum, []);
         this.parts.push(newPart);

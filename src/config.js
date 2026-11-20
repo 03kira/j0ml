@@ -9,7 +9,7 @@ export const DATA_DIR = path.join(ROOT_DIR, 'data');
 export const CATALOG_DIR = path.join(DATA_DIR, 'catalog');
 export const ENRICHED_DIR = path.join(DATA_DIR, 'enriched');
 export const CHECKPOINT_PATH = path.join(DATA_DIR, 'checkpoint.json');
-export const CATALOG_FILE = path.join(CATALOG_DIR, 'jav_catalog.json');
+export const CATALOG_FILE = path.join(CATALOG_DIR, 'javhd_catalog.json');
 
 export const BASE_URL = 'https://javhd.today';
 export const RELEASEDAY_URL = `${BASE_URL}/releaseday/`;

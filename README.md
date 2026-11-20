@@ -10,36 +10,36 @@ High-performance, resilient scraper and database builder for [JAVHD.today](https
 - **Two-Stage Pipeline**:
   1. **Stage 1 (Catalog Indexer)**: Crawls `https://javhd.today/releaseday/?ajax=browse_videos&page={p}` across all ~13,569 pages (~380,000 items). Extracts IDs, DVD release codes (e.g. `DAL-013`, `JIMMY-016`), titles, thumbnail URLs, durations, HD badges, view counts, and upload relative dates.
   2. **Stage 2 (Detail & Stream Enricher)**: Crawls each video dossier, decodes Base64 multi-server streaming buttons (BpServer, Fastserver, Myserver, Topserver, STserver, Dood, Streamtape, etc.), resolves studio/channels, director, release date, cast/actresses, genres, and tags.
-- **85 MB Auto-Partitioning (`PartitionManager`)**: Automatically manages and rotates chunked JSON files (`jav_enriched_part1.json`, `jav_enriched_part2.json`, ...) strictly under 85 MB so the repository never exceeds GitHub's 100 MB hard limit.
-- **Auto-Cascading GitHub Actions**: `.github/workflows/jav_enrich.yml` runs 4.5-hour batches, automatically commits and pushes enriched data, and triggers the next cycle if pending titles remain.
+- **85 MB Auto-Partitioning (`PartitionManager`)**: Automatically manages and rotates chunked JSON files (`javhd_enriched_part1.json`, `javhd_enriched_part2.json`, ...) strictly under 85 MB so the repository never exceeds GitHub's 100 MB hard limit.
+- **Auto-Cascading GitHub Actions**: `.github/workflows/javhd_enrich.yml` runs 4.5-hour batches, automatically commits and pushes enriched data, and triggers the next cycle if pending titles remain.
 
 ---
 
 ## 📁 Repository Structure
 
 ```text
-JAV_GHA/
+JAVHD_GHA/
 ├── .github/
 │   └── workflows/
-│       └── jav_enrich.yml       # Auto-cascading GitHub Actions workflow
+│       └── javhd_enrich.yml       # Auto-cascading GitHub Actions workflow
 ├── data/
 │   ├── catalog/
-│   │   ├── jav_catalog_test.json # Sample test catalog (84 items)
-│   │   └── jav_catalog.json      # Production indexed catalog
+│   │   ├── javhd_catalog_test.json # Sample test catalog (84 items)
+│   │   └── javhd_catalog.json      # Production indexed catalog
 │   ├── enriched/
-│   │   ├── jav_enriched_part1.json # Enriched dataset partition 1 (< 85 MB)
-│   │   └── jav_enriched_part2.json # Enriched dataset partition 2 ...
-│   └── checkpoint.json          # Indexer & Enricher progress checkpoints
+│   │   ├── javhd_enriched_part1.json # Enriched dataset partition 1 (< 85 MB)
+│   │   └── javhd_enriched_part2.json # Enriched dataset partition 2 ...
+│   └── checkpoint.json            # Indexer & Enricher progress checkpoints
 ├── src/
-│   ├── client.js                # Resilient curl HTTP engine with auto-retry
-│   ├── config.js                # Endpoints, headers, timeouts, partition caps
-│   ├── indexer.js               # Fast catalog crawler with checkpointing
-│   ├── parser.js                # Zero-dependency regex card & detail parser
-│   ├── partition.js             # 85 MB partition manager with in-memory index
-│   ├── enricher.js              # Full metadata & streaming server crawler
-│   ├── probe.js                 # Domain connectivity diagnostic tool
-│   ├── check-continue.js        # GHA worker continuation trigger
-│   └── status.js                # Formatted CLI status report
+│   ├── client.js                  # Resilient curl HTTP engine with auto-retry
+│   ├── config.js                  # Endpoints, headers, timeouts, partition caps
+│   ├── indexer.js                 # Fast catalog crawler with checkpointing
+│   ├── parser.js                  # Zero-dependency regex card & detail parser
+│   ├── partition.js               # 85 MB partition manager with in-memory index
+│   ├── enricher.js                # Full metadata & streaming server crawler
+│   ├── probe.js                   # Domain connectivity diagnostic tool
+│   ├── check-continue.js          # GHA worker continuation trigger
+│   └── status.js                  # Formatted CLI status report
 ├── package.json
 └── README.md
 ```
@@ -90,7 +90,7 @@ npm run status
 
 ## 📊 Dataset Schema
 
-Each video record in `data/enriched/jav_enriched_partN.json` adheres to:
+Each video record in `data/enriched/javhd_enriched_partN.json` adheres to:
 
 ```json
 {
