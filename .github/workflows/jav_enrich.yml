@@ -1,0 +1,93 @@
+name: JAVHD Data Enrichment Worker
+
+on:
+  workflow_dispatch:
+    inputs:
+      limit:
+        description: 'Limit titles to scrape in this run (0 for all pending)'
+        required: false
+        default: '0'
+      max_minutes:
+        description: 'Safety timer in minutes before graceful commit (default 270 = 4.5 hours)'
+        required: false
+        default: '270'
+      max_part_mb:
+        description: 'Max size in MB per partition file before sharding (default 85 to stay strictly under GitHub 100MB limit)'
+        required: false
+        default: '85'
+      auto_continue:
+        description: 'Auto-restart workflow after 5 min cooldown if pending titles remain (true/false)'
+        required: false
+        default: 'true'
+
+jobs:
+  enrich:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    permissions:
+      contents: write
+      actions: write
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.WORKFLOW_PAT || secrets.GH_PAT || secrets.GITHUB_TOKEN }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Probe JAVHD Connectivity
+        run: node src/probe.js
+
+      - name: Run Deep Detail Enrichment
+        id: enricher
+        run: |
+          node src/enricher.js \
+            --limit ${{ github.event.inputs.limit || '0' }} \
+            --max-minutes ${{ github.event.inputs.max_minutes || '270' }} \
+            --max-part-mb ${{ github.event.inputs.max_part_mb || '85' }}
+
+      - name: Commit and Push Enriched JSON Data
+        if: always()
+        run: |
+          echo "📊 Current dataset partitions status:"
+          node src/status.js || true
+
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/
+          git commit -m "Auto-enrich: sync JAV dossiers [skip ci]" || echo "No changes to commit"
+          git pull --rebase origin main || true
+          git push origin HEAD:main || echo "Already up to date"
+
+      - name: Auto-Continue Enrichment Run After 5-Minute Cooldown
+        if: success() && (github.event.inputs.auto_continue != 'false')
+        env:
+          GH_TOKEN: ${{ secrets.WORKFLOW_PAT || secrets.GH_PAT || secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.WORKFLOW_PAT || secrets.GH_PAT || secrets.GITHUB_TOKEN }}
+        run: |
+          echo "=========================================================="
+          echo "🔍 Checking for remaining pending titles in catalog..."
+          echo "=========================================================="
+
+          CHECK_RESULT=$(node src/check-continue.js)
+          echo "Status: $CHECK_RESULT"
+
+          if echo "$CHECK_RESULT" | grep -q "CONTINUE"; then
+            PENDING_COUNT=$(echo "$CHECK_RESULT" | awk '{print $2}')
+            echo "⏳ $PENDING_COUNT titles remain pending in JAV catalog."
+            echo "Sleeping 300s (5 minutes) cooldown to avoid rate limits..."
+            sleep 300
+
+            echo "🚀 Triggering next JAV enrichment run..."
+            gh workflow run jav_enrich.yml \
+              -f limit="${{ github.event.inputs.limit || '0' }}" \
+              -f max_minutes="${{ github.event.inputs.max_minutes || '270' }}" \
+              -f max_part_mb="${{ github.event.inputs.max_part_mb || '85' }}" \
+              -f auto_continue="true" || echo "Workflow trigger failed"
+          else
+            echo "🎉 ALL catalog titles are 100% enriched! JAVHD scraper pipeline complete."
+          fi

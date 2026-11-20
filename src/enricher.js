@@ -1,0 +1,302 @@
+/**
+ * JAVHD.today Detail Enrichment Engine
+ * Reads indexed catalog, fetches full video details & streaming server embeds,
+ * and writes to partitioned JSON files (split at 85 MB to stay strictly under GitHub's 100 MB limit).
+ */
+
+import fs from 'node:fs';
+import path from 'node:path';
+import { HttpClient } from './client.js';
+import { PartitionManager } from './partition.js';
+import { parseVideoDetail } from './parser.js';
+import {
+    CATALOG_FILE,
+    CATALOG_DIR,
+    CHECKPOINT_PATH,
+    DEFAULT_DELAY_MS,
+    BASE_URL
+} from './config.js';
+
+function parseArgs() {
+    const args = process.argv.slice(2);
+    const options = {
+        isTest: false,
+        limit: Infinity,
+        batchSize: Infinity,
+        delayMs: DEFAULT_DELAY_MS,
+        maxMinutes: 270, // 4.5 hours safe cutoff for GitHub Actions
+        maxPartMb: 85,
+        targetId: null,
+        targetUrl: null
+    };
+
+    for (let i = 0; i < args.length; i++) {
+        if (args[i] === '--test') {
+            options.isTest = true;
+            options.limit = 5;
+        } else if (args[i] === '--limit' && args[i + 1]) {
+            const parsed = parseInt(args[i + 1], 10);
+            options.limit = parsed > 0 ? parsed : Infinity;
+            i++;
+        } else if (args[i] === '--batch' && args[i + 1]) {
+            const parsed = parseInt(args[i + 1], 10);
+            options.batchSize = parsed > 0 ? parsed : Infinity;
+            i++;
+        } else if (args[i] === '--delay' && args[i + 1]) {
+            options.delayMs = parseInt(args[i + 1], 10);
+            i++;
+        } else if (args[i] === '--max-minutes' && args[i + 1]) {
+            options.maxMinutes = parseFloat(args[i + 1]);
+            i++;
+        } else if (args[i] === '--max-part-mb' && args[i + 1]) {
+            options.maxPartMb = parseFloat(args[i + 1]);
+            i++;
+        } else if (args[i] === '--id' && args[i + 1]) {
+            options.targetId = args[i + 1];
+            i++;
+        } else if (args[i] === '--url' && args[i + 1]) {
+            options.targetUrl = args[i + 1];
+            i++;
+        }
+    }
+
+    return options;
+}
+
+function loadCheckpoint() {
+    if (fs.existsSync(CHECKPOINT_PATH)) {
+        try {
+            return JSON.parse(fs.readFileSync(CHECKPOINT_PATH, 'utf8'));
+        } catch {}
+    }
+    return {
+        catalog: {},
+        enrichment: {
+            totalEnriched: 0,
+            failedItems: {},
+            lastUpdated: null
+        }
+    };
+}
+
+function saveCheckpoint(state) {
+    if (!fs.existsSync(path.dirname(CHECKPOINT_PATH))) {
+        fs.mkdirSync(path.dirname(CHECKPOINT_PATH), { recursive: true });
+    }
+    const tempPath = `${CHECKPOINT_PATH}.tmp`;
+    fs.writeFileSync(tempPath, JSON.stringify(state, null, 2), 'utf8');
+    fs.renameSync(tempPath, CHECKPOINT_PATH);
+}
+
+/**
+ * Loads catalog items from either test file, single catalog file, or partitioned catalog files.
+ */
+export function loadAllCatalogItems(isTest = false) {
+    if (isTest) {
+        const testPath = path.join(CATALOG_DIR, 'jav_catalog_test.json');
+        if (fs.existsSync(testPath)) {
+            return JSON.parse(fs.readFileSync(testPath, 'utf8'));
+        }
+    }
+
+    if (!fs.existsSync(CATALOG_DIR)) return [];
+
+    const files = fs.readdirSync(CATALOG_DIR);
+    const partFiles = files
+        .filter(f => /^jav_catalog_part\d+\.json$/.test(f))
+        .sort((a, b) => {
+            const numA = parseInt(a.match(/\d+/)[0], 10);
+            const numB = parseInt(b.match(/\d+/)[0], 10);
+            return numA - numB;
+        });
+
+    if (partFiles.length > 0) {
+        const allItems = [];
+        for (const pf of partFiles) {
+            const pPath = path.join(CATALOG_DIR, pf);
+            try {
+                const items = JSON.parse(fs.readFileSync(pPath, 'utf8'));
+                if (Array.isArray(items)) allItems.push(...items);
+            } catch (err) {
+                console.error(`[Enricher] Error reading ${pf}: ${err.message}`);
+            }
+        }
+        return allItems;
+    }
+
+    if (fs.existsSync(CATALOG_FILE)) {
+        try {
+            return JSON.parse(fs.readFileSync(CATALOG_FILE, 'utf8'));
+        } catch (err) {
+            console.error(`[Enricher] Error reading ${path.basename(CATALOG_FILE)}: ${err.message}`);
+        }
+    }
+
+    return [];
+}
+
+export async function runEnricher() {
+    const opts = parseArgs();
+    const client = new HttpClient({ delayMs: opts.delayMs });
+    const maxPartSizeBytes = opts.maxPartMb * 1024 * 1024;
+    const partitionManager = new PartitionManager(undefined, maxPartSizeBytes);
+    const checkpoint = loadCheckpoint();
+    const maxDurationMs = opts.maxMinutes * 60 * 1000;
+
+    if (!checkpoint.enrichment) {
+        checkpoint.enrichment = {
+            totalEnriched: 0,
+            failedItems: {},
+            lastUpdated: null
+        };
+    }
+
+    // 1. Single Video Mode
+    if (opts.targetId || opts.targetUrl) {
+        const target = opts.targetUrl || opts.targetId;
+        console.log(`[Enricher] 🎯 Single target requested: ${target}`);
+        const html = await client.getVideoHtml(target);
+        if (!html) {
+            console.error(`[Enricher] ❌ Could not fetch HTML for: ${target}`);
+            return;
+        }
+        const fullUrl = String(target).startsWith('http') ? target : `${BASE_URL}/${target}/`;
+        const parsed = parseVideoDetail(html, fullUrl);
+        console.log(JSON.stringify(parsed, null, 2));
+        return;
+    }
+
+    // 2. Load Catalog Items
+    const catalog = loadAllCatalogItems(opts.isTest);
+    if (!catalog || catalog.length === 0) {
+        console.error(`[Enricher] ❌ No catalog items found in ${CATALOG_DIR}!`);
+        console.error(`Please run indexer first: npm run index:test (or npm run index:all)`);
+        process.exit(1);
+    }
+
+    console.log(`[Enricher] 📂 Loaded ${catalog.length} titles from catalog.`);
+
+    // 3. Filter Pending Items (not yet in PartitionManager)
+    const pendingItems = [];
+    for (const item of catalog) {
+        if (!partitionManager.has(item.id, item.code, item.slug)) {
+            pendingItems.push(item);
+        }
+    }
+
+    console.log(`[Enricher] 📊 Status: ${partitionManager.allIds.size} already enriched, ${pendingItems.length} pending.`);
+
+    if (pendingItems.length === 0) {
+        console.log(`[Enricher] 🎉 All catalog titles are already fully enriched! Nothing to do.`);
+        return;
+    }
+
+    const maxToProcess = Math.min(pendingItems.length, opts.limit, opts.batchSize);
+
+    console.log(`\n======================================================`);
+    console.log(`         🚀 JAVHD.TODAY ENRICHMENT WORKER             `);
+    console.log(`======================================================`);
+    console.log(`- Mode:       ${opts.isTest ? 'TEST (5 items)' : 'PRODUCTION'}`);
+    console.log(`- Batch Size: ${maxToProcess}`);
+    console.log(`- Delay:      ${opts.delayMs} ms`);
+    console.log(`- Timeout:    ${opts.maxMinutes} mins`);
+    console.log(`- Max Part:   ${opts.maxPartMb} MB`);
+    console.log(`======================================================\n`);
+
+    let processedCount = 0;
+    let successCount = 0;
+    let failedCount = 0;
+    const startTime = Date.now();
+
+    // Graceful interrupt handling
+    process.on('SIGINT', () => {
+        console.log('\n\n💾 Interrupted! Flushing dataset & checkpoint before exit...');
+        partitionManager.flush();
+        checkpoint.enrichment.totalEnriched = partitionManager.allIds.size;
+        checkpoint.enrichment.lastUpdated = new Date().toISOString();
+        saveCheckpoint(checkpoint);
+        console.log('✅ Progress safely saved. You can resume anytime.\n');
+        process.exit(0);
+    });
+
+    for (const item of pendingItems) {
+        if (processedCount >= maxToProcess) break;
+
+        // Safety timeout check
+        if (Date.now() - startTime >= maxDurationMs) {
+            console.log(`\n⏳ Safety time limit reached (${opts.maxMinutes} mins). Stopping gracefully to commit & push...`);
+            break;
+        }
+
+        const identifier = item.id || item.code || item.slug;
+        const pageUrl = item.url || `${BASE_URL}/${item.id}/${item.slug ? `${item.slug}/` : ''}`;
+
+        try {
+            const html = await client.getVideoHtml(pageUrl);
+
+            if (!html) {
+                console.warn(`[Enricher] ⚠️ Video #${item.id} (${item.code || 'NO-CODE'}): 404 or empty HTML.`);
+                checkpoint.enrichment.failedItems[String(identifier)] = 'Empty / 404';
+                failedCount++;
+            } else {
+                const detail = parseVideoDetail(html, pageUrl, item);
+                if (detail && detail.id) {
+                    partitionManager.add(detail);
+                    successCount++;
+
+                    const pct = (((processedCount + 1) / maxToProcess) * 100).toFixed(1);
+                    const codeDisplay = detail.code ? `[${detail.code}]` : '';
+                    const serversCount = detail.servers ? detail.servers.length : 0;
+                    const dateDisplay = detail.release_date || 'N/A';
+                    console.log(`[${processedCount + 1}/${maxToProcess} (${pct}%)] ✅ ${codeDisplay} "${detail.title.slice(0, 45)}..." | ${serversCount} servers | ${dateDisplay}`);
+                } else {
+                    console.warn(`[Enricher] ⚠️ Video #${item.id}: Parser returned null.`);
+                    failedCount++;
+                }
+            }
+        } catch (err) {
+            console.error(`[Enricher] ❌ Error on #${item.id} (${item.code || 'NO-CODE'}): ${err.message}`);
+            checkpoint.enrichment.failedItems[String(identifier)] = err.message;
+            failedCount++;
+        }
+
+        processedCount++;
+
+        // Periodic flush every 25 items
+        if (processedCount % 25 === 0) {
+            partitionManager.flush();
+            checkpoint.enrichment.totalEnriched = partitionManager.allIds.size;
+            checkpoint.enrichment.lastUpdated = new Date().toISOString();
+            saveCheckpoint(checkpoint);
+        }
+    }
+
+    // Final flush
+    partitionManager.flush();
+    checkpoint.enrichment.totalEnriched = partitionManager.allIds.size;
+    checkpoint.enrichment.lastUpdated = new Date().toISOString();
+    saveCheckpoint(checkpoint);
+
+    const elapsedSec = ((Date.now() - startTime) / 1000).toFixed(1);
+    const speed = elapsedSec > 0 ? (processedCount / elapsedSec).toFixed(2) : 0;
+    const stats = partitionManager.getStats();
+
+    console.log(`\n======================================================`);
+    console.log(`[Enricher] 🎉 Enrichment Run Finished!`);
+    console.log(`- Processed:    ${processedCount} titles (${successCount} succeeded, ${failedCount} failed)`);
+    console.log(`- Total in DB:  ${stats.totalItems}`);
+    console.log(`- Partitions:   ${stats.totalParts} active file(s) (Total: ${stats.totalSizeMB} MB)`);
+    for (const p of stats.partsSummary) {
+        console.log(`  * ${p.file}: ${p.items} items, ${p.sizeMB} MB`);
+    }
+    console.log(`- Speed:        ${speed} titles/sec (${elapsedSec}s elapsed)`);
+    console.log(`======================================================\n`);
+}
+
+// Auto-run if executed directly via CLI
+if (process.argv[1] && process.argv[1].endsWith('enricher.js')) {
+    runEnricher().catch(err => {
+        console.error('[Enricher] Fatal error:', err);
+        process.exit(1);
+    });
+}
