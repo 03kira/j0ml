@@ -154,4 +154,29 @@ export class HttpClient {
             'X-Requested-With': undefined
         });
     }
+
+    /**
+     * Fetches video download page HTML.
+     */
+    async getDownloadHtml(id) {
+        if (!id) return null;
+        const url = `${BASE_URL}/download/${id}/`;
+        return await this.get(url, {
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+            'Referer': `${BASE_URL}/${id}/`
+        });
+    }
+
+    /**
+     * Fetches related videos AJAX JSON.
+     */
+    async getRelatedVideos(canonicalUrl) {
+        if (!canonicalUrl) return null;
+        const cleanUrl = canonicalUrl.endsWith('/') ? canonicalUrl : `${canonicalUrl}/`;
+        const url = `${cleanUrl}?ajax=related`;
+        return await this.getJson(url, {
+            'X-Requested-With': 'XMLHttpRequest',
+            'Referer': cleanUrl
+        });
+    }
 }

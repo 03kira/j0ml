@@ -1,6 +1,6 @@
 /**
  * JAVHD.today HTML & Card Parser
- * Pure zero-dependency regular expression parser for video cards, pagination, and full detail pages.
+ * Pure zero-dependency regular expression parser for video cards, pagination, download pages, and full detail dossiers.
  */
 
 import { BASE_URL } from './config.js';
@@ -19,7 +19,7 @@ export function decodeHtmlEntities(str) {
 }
 
 /**
- * Parses video cards from the AJAX HTML payload of catalog pages.
+ * Parses video cards from the AJAX HTML payload of catalog pages or related videos.
  */
 export function parseVideoCards(html) {
     if (!html || typeof html !== 'string') return [];
@@ -128,9 +128,44 @@ export function parsePagination(paginationHtml, fallbackTotal = 13569) {
 }
 
 /**
- * Parses full video detail page HTML into enriched schema.
+ * Parses direct download links from video download page (https://javhd.today/download/{id}/).
  */
-export function parseVideoDetail(html, pageUrl, catalogItem = {}) {
+export function parseDownloads(downloadHtml) {
+    if (!downloadHtml || typeof downloadHtml !== 'string') return [];
+
+    const downloads = [];
+    const seenUrls = new Set();
+
+    const linkRegex = /<a[^>]*href=['"\\]+([^'"\\]+)['"\\]+[^>]*>([\s\S]*?)<\/a>/gi;
+    let match;
+
+    while ((match = linkRegex.exec(downloadHtml)) !== null) {
+        let url = match[1].trim();
+        const text = match[2].replace(/<[^>]+>/g, '').trim();
+
+        if (url.startsWith('\\')) url = url.replace(/^\\+/, '');
+        if (text.toLowerCase().includes('download') || url.includes('/embed/') || url.includes('/d/') || url.includes('/f/') || url.includes('/e/')) {
+            if (url.startsWith('http') && !seenUrls.has(url)) {
+                seenUrls.add(url);
+                const nameMatch = text.match(/Download\s+([A-Za-z0-9_-]+)(?:\.mp4)?/i);
+                const serverName = nameMatch ? nameMatch[1] : (url.match(/https?:\/\/([^/]+)/) || [])[1] || 'Download';
+
+                downloads.push({
+                    server: serverName,
+                    url,
+                    label: text
+                });
+            }
+        }
+    }
+
+    return downloads;
+}
+
+/**
+ * Parses full video detail page HTML into enriched schema with download sources, embed sources, and related videos.
+ */
+export function parseVideoDetail(html, pageUrl, catalogItem = {}, extras = {}) {
     if (!html || typeof html !== 'string') return null;
 
     // 1. Video ID
@@ -262,7 +297,7 @@ export function parseVideoDetail(html, pageUrl, catalogItem = {}) {
         }
     }
 
-    // 13. Decoded Streaming Servers
+    // 13. Decoded Streaming Servers & Embed Sources
     const servers = [];
     const seenServers = new Set();
     const btnRegex = /<button[^>]*class=["'][^"']*button_choice_server[^"']*["'][^>]*>([\s\S]*?)<\/button>/gi;
@@ -300,14 +335,39 @@ export function parseVideoDetail(html, pageUrl, catalogItem = {}) {
 
         if (name && (embedUrl || failoverUrls.length > 0) && !seenServers.has(name)) {
             seenServers.add(name);
+            const resolvedEmbedSrc = embedUrl || failoverUrls[0] || '';
+            const iframeCode = `<iframe src="${resolvedEmbedSrc}" width="100%" height="100%" frameborder="0" scrolling="no" allowfullscreen></iframe>`;
+
             servers.push({
                 name,
-                iframe_src: embedUrl || failoverUrls[0] || '',
-                embed_url: embedUrl || failoverUrls[0] || '',
+                embed_src: resolvedEmbedSrc,
+                iframe_src: resolvedEmbedSrc,
+                iframe_code: iframeCode,
                 failover_urls: failoverUrls.length > 0 ? failoverUrls : undefined,
                 is_direct_player: /data-player=["']1["']/i.test(btnHtml) || embedsB64 !== undefined
             });
         }
+    }
+
+    const primaryEmbedSrc = servers[0]?.embed_src || null;
+    const primaryIframeCode = primaryEmbedSrc 
+        ? `<iframe src="${primaryEmbedSrc}" width="100%" height="100%" frameborder="0" scrolling="no" allowfullscreen></iframe>`
+        : null;
+
+    // 14. Download Sources
+    let downloads = [];
+    if (extras.downloads && Array.isArray(extras.downloads)) {
+        downloads = extras.downloads;
+    } else if (extras.downloadHtml) {
+        downloads = parseDownloads(extras.downloadHtml);
+    }
+
+    // 15. Related Videos
+    let relatedVideos = [];
+    if (extras.relatedVideos && Array.isArray(extras.relatedVideos)) {
+        relatedVideos = extras.relatedVideos;
+    } else if (extras.relatedHtml) {
+        relatedVideos = parseVideoCards(extras.relatedHtml).filter(v => v.id !== id);
     }
 
     return {
@@ -328,8 +388,13 @@ export function parseVideoDetail(html, pageUrl, catalogItem = {}) {
         actresses,
         genres,
         tags,
+        primary_embed_src: primaryEmbedSrc,
+        primary_iframe_src: primaryEmbedSrc,
+        embed_code: primaryIframeCode,
         servers,
-        primary_iframe_src: servers[0]?.iframe_src || null,
+        download_page_url: id ? `${BASE_URL}/download/${id}/` : null,
+        downloads,
+        related_videos: relatedVideos.slice(0, 12),
         views: catalogItem.views || null,
         likes: catalogItem.likes || null,
         scraped_at: new Date().toISOString()

@@ -160,8 +160,27 @@ export async function runEnricher() {
             console.error(`[Enricher] ❌ Could not fetch HTML for: ${target}`);
             return;
         }
-        const fullUrl = String(target).startsWith('http') ? target : `${BASE_URL}/${target}/`;
-        const parsed = parseVideoDetail(html, fullUrl);
+        const ogUrlMatch = html.match(/property=["']og:url["'][^>]*content=["']([^"']+)["']/i) ||
+                           html.match(/content=["']([^"']+)["'][^>]*property=["']og:url["']/i);
+        const canonicalUrl = ogUrlMatch ? ogUrlMatch[1] : (String(target).startsWith('http') ? target : `${BASE_URL}/${target}/`);
+        const idMatch = canonicalUrl.match(/\/(\d+)\//);
+        const id = idMatch ? parseInt(idMatch[1], 10) : null;
+
+        let downloadHtml = null;
+        let relatedJson = null;
+        try {
+            const [dlRes, relRes] = await Promise.allSettled([
+                client.getDownloadHtml(id),
+                client.getRelatedVideos(canonicalUrl)
+            ]);
+            if (dlRes.status === 'fulfilled') downloadHtml = dlRes.value;
+            if (relRes.status === 'fulfilled') relatedJson = relRes.value;
+        } catch {}
+
+        const parsed = parseVideoDetail(html, canonicalUrl, {}, {
+            downloadHtml,
+            relatedHtml: relatedJson?.html
+        });
         console.log(JSON.stringify(parsed, null, 2));
         return;
     }
@@ -239,7 +258,23 @@ export async function runEnricher() {
                 checkpoint.enrichment.failedItems[String(identifier)] = 'Empty / 404';
                 failedCount++;
             } else {
-                const detail = parseVideoDetail(html, pageUrl, item);
+                // Fetch download page HTML & related videos in parallel
+                let downloadHtml = null;
+                let relatedJson = null;
+                try {
+                    const [dlRes, relRes] = await Promise.allSettled([
+                        client.getDownloadHtml(item.id),
+                        client.getRelatedVideos(pageUrl)
+                    ]);
+                    if (dlRes.status === 'fulfilled') downloadHtml = dlRes.value;
+                    if (relRes.status === 'fulfilled') relatedJson = relRes.value;
+                } catch {}
+
+                const detail = parseVideoDetail(html, pageUrl, item, {
+                    downloadHtml,
+                    relatedHtml: relatedJson?.html
+                });
+
                 if (detail && detail.id) {
                     partitionManager.add(detail);
                     successCount++;
@@ -247,8 +282,10 @@ export async function runEnricher() {
                     const pct = (((processedCount + 1) / maxToProcess) * 100).toFixed(1);
                     const codeDisplay = detail.code ? `[${detail.code}]` : '';
                     const serversCount = detail.servers ? detail.servers.length : 0;
+                    const dlCount = detail.downloads ? detail.downloads.length : 0;
+                    const relCount = detail.related_videos ? detail.related_videos.length : 0;
                     const dateDisplay = detail.release_date || 'N/A';
-                    console.log(`[${processedCount + 1}/${maxToProcess} (${pct}%)] ✅ ${codeDisplay} "${detail.title.slice(0, 45)}..." | ${serversCount} servers | ${dateDisplay}`);
+                    console.log(`[${processedCount + 1}/${maxToProcess} (${pct}%)] ✅ ${codeDisplay} "${detail.title.slice(0, 32)}..." | ${serversCount} streams | ${dlCount} dl | ${relCount} rel | ${dateDisplay}`);
                 } else {
                     console.warn(`[Enricher] ⚠️ Video #${item.id}: Parser returned null.`);
                     failedCount++;
