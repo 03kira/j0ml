@@ -115,9 +115,9 @@ export class PartitionManager {
     }
 
     has(id, code, slug) {
-        if (id != null && this.allIds.has(String(id))) return true;
-        if (code && this.allCodes.has(String(code).toUpperCase())) return true;
-        if (slug && this.allSlugs.has(String(slug).toLowerCase())) return true;
+        if (id != null) return this.allIds.has(String(id));
+        if (code) return this.allCodes.has(String(code).toUpperCase());
+        if (slug) return this.allSlugs.has(String(slug).toLowerCase());
         return false;
     }
 

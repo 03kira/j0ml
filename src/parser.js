@@ -300,7 +300,7 @@ export function parseVideoDetail(html, pageUrl, catalogItem = {}, extras = {}) {
     // 13. Decoded Streaming Servers & Embed Sources
     const servers = [];
     const seenServers = new Set();
-    const btnRegex = /<button[^>]*class=["'][^"']*button_choice_server[^"']*["'][^>]*>([\s\S]*?)<\/button>/gi;
+    const btnRegex = /<(?:button|div|a)[^>]*class=["'][^"']*(?:button_choice_server|server-option)[^"']*["'][^>]*>([\s\S]*?)<\/(?:button|div|a)>/gi;
     let btnMatch;
 
     while ((btnMatch = btnRegex.exec(html)) !== null) {
@@ -345,6 +345,21 @@ export function parseVideoDetail(html, pageUrl, catalogItem = {}, extras = {}) {
                 iframe_code: iframeCode,
                 failover_urls: failoverUrls.length > 0 ? failoverUrls : undefined,
                 is_direct_player: /data-player=["']1["']/i.test(btnHtml) || embedsB64 !== undefined
+            });
+        }
+    }
+
+    // Safety fallback: search for direct iframe player embed in HTML if no servers were found
+    if (servers.length === 0) {
+        const iframeMatch = html.match(/<iframe[^>]*src=["'](https?:\/\/[^"']+)["'][^>]*><\/iframe>/i);
+        if (iframeMatch) {
+            const fallbackSrc = iframeMatch[1];
+            servers.push({
+                name: 'DefaultPlayer',
+                embed_src: fallbackSrc,
+                iframe_src: fallbackSrc,
+                iframe_code: iframeMatch[0],
+                is_direct_player: true
             });
         }
     }
@@ -394,6 +409,11 @@ export function parseVideoDetail(html, pageUrl, catalogItem = {}, extras = {}) {
         servers,
         download_page_url: id ? `${BASE_URL}/download/${id}/` : null,
         downloads,
+        streams: {
+            primary: primaryEmbedSrc,
+            embed_sources: servers,
+            download_sources: downloads
+        },
         related_videos: relatedVideos.slice(0, 12),
         views: catalogItem.views || null,
         likes: catalogItem.likes || null,

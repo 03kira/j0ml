@@ -246,16 +246,19 @@ export async function runEnricher() {
     let failedCount = 0;
     const startTime = Date.now();
 
-    // Graceful interrupt handling
-    process.on('SIGINT', () => {
-        console.log('\n\n💾 Interrupted! Flushing dataset & checkpoint before exit...');
+    // Graceful interrupt handling (SIGINT, SIGTERM)
+    const gracefulShutdown = (signal) => {
+        console.log(`\n\n💾 ${signal} received! Flushing dataset & checkpoint before exit...`);
         partitionManager.flush();
         checkpoint.enrichment.totalEnriched = partitionManager.allIds.size;
         checkpoint.enrichment.lastUpdated = new Date().toISOString();
         saveCheckpoint(checkpoint);
         console.log('✅ Progress safely saved. You can resume anytime.\n');
         process.exit(0);
-    });
+    };
+
+    process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+    process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
 
     for (const item of pendingItems) {
         if (processedCount >= maxToProcess) break;
@@ -299,8 +302,8 @@ export async function runEnricher() {
                 successCount++;
 
                 const code = enriched.code || 'NO-CODE';
-                const serversCount = (enriched.streams?.embed_sources || []).length;
-                const dlCount = (enriched.streams?.download_sources || []).length;
+                const serversCount = (enriched.streams?.embed_sources || enriched.servers || []).length;
+                const dlCount = (enriched.streams?.download_sources || enriched.downloads || []).length;
                 const relCount = (enriched.related_videos || []).length;
 
                 console.log(`[${processedCount + 1}/${maxToProcess}] ✅ Enriched #${item.id} [${code}]: "${enriched.title?.slice(0, 35)}..." (${serversCount} embeds, ${dlCount} dl, ${relCount} rel)`);
@@ -313,8 +316,8 @@ export async function runEnricher() {
 
         processedCount++;
 
-        // Periodic checkpoint every 25 items
-        if (processedCount % 25 === 0) {
+        // Periodic checkpoint: immediately on items 1, 5, 10, then every 20 items
+        if (processedCount === 1 || processedCount === 5 || processedCount === 10 || processedCount % 20 === 0) {
             partitionManager.flush();
             checkpoint.enrichment.totalEnriched = partitionManager.allIds.size;
             checkpoint.enrichment.lastUpdated = new Date().toISOString();
