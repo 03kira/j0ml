@@ -3,6 +3,14 @@ name: JAVHD Data Enrichment Worker
 on:
   workflow_dispatch:
     inputs:
+      direction:
+        description: 'Cascade direction: desc (newest first) or asc (oldest first)'
+        required: false
+        default: 'desc'
+        type: choice
+        options:
+          - desc
+          - asc
       limit:
         description: 'Limit titles to scrape in this run (0 for all pending)'
         required: false
@@ -46,6 +54,7 @@ jobs:
         id: enricher
         run: |
           node src/enricher.js \
+            --direction ${{ github.event.inputs.direction || 'desc' }} \
             --limit ${{ github.event.inputs.limit || '0' }} \
             --max-minutes ${{ github.event.inputs.max_minutes || '270' }} \
             --max-part-mb ${{ github.event.inputs.max_part_mb || '85' }}
@@ -59,18 +68,30 @@ jobs:
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
           git add data/
-          git commit -m "Auto-enrich: sync JAV dossiers [skip ci]" || echo "No changes to commit"
-          git pull --rebase origin main || true
-          git push origin HEAD:main || echo "Already up to date"
+          git commit -m "Auto-enrich: sync JAVHD dossiers (${{ github.event.inputs.direction || 'desc' }}) [skip ci]" || echo "No changes to commit"
+
+          for i in {1..5}; do
+            git pull --rebase -X ours origin main || true
+            if git push origin HEAD:main; then
+              echo "✅ Successfully pushed to main"
+              break
+            fi
+            echo "⚠️ Push conflict, retrying in 5s (attempt $i/5)..."
+            sleep 5
+          done
 
       - name: Auto-Continue Enrichment Run After 5-Minute Cooldown
         if: success() && (github.event.inputs.auto_continue != 'false')
         env:
           GH_TOKEN: ${{ secrets.WORKFLOW_PAT || secrets.GH_PAT || secrets.GITHUB_TOKEN }}
           GITHUB_TOKEN: ${{ secrets.WORKFLOW_PAT || secrets.GH_PAT || secrets.GITHUB_TOKEN }}
+          DIRECTION: ${{ github.event.inputs.direction || 'desc' }}
+          BATCH_LIMIT: ${{ github.event.inputs.limit || '0' }}
+          MAX_MINUTES: ${{ github.event.inputs.max_minutes || '270' }}
+          MAX_PART_MB: ${{ github.event.inputs.max_part_mb || '85' }}
         run: |
           echo "=========================================================="
-          echo "🔍 Checking for remaining pending titles in catalog..."
+          echo "🔍 Checking for remaining pending titles in catalog ($DIRECTION)..."
           echo "=========================================================="
 
           CHECK_RESULT=$(node src/check-continue.js)
@@ -78,16 +99,26 @@ jobs:
 
           if echo "$CHECK_RESULT" | grep -q "CONTINUE"; then
             PENDING_COUNT=$(echo "$CHECK_RESULT" | awk '{print $2}')
-            echo "⏳ $PENDING_COUNT titles remain pending in JAV catalog."
+            echo "⏳ $PENDING_COUNT titles remain pending in JAVHD catalog."
             echo "Sleeping 300s (5 minutes) cooldown to avoid rate limits..."
             sleep 300
 
-            echo "🚀 Triggering next JAVHD enrichment run..."
+            echo "🚀 Triggering next JAVHD enrichment run ($DIRECTION)..."
             gh workflow run javhd_enrich.yml \
-              -f limit="${{ github.event.inputs.limit || '0' }}" \
-              -f max_minutes="${{ github.event.inputs.max_minutes || '270' }}" \
-              -f max_part_mb="${{ github.event.inputs.max_part_mb || '85' }}" \
-              -f auto_continue="true" || echo "Workflow trigger failed"
+              --ref "${{ github.ref_name || 'main' }}" \
+              -f direction="$DIRECTION" \
+              -f limit="$BATCH_LIMIT" \
+              -f max_minutes="$MAX_MINUTES" \
+              -f max_part_mb="$MAX_PART_MB" \
+              -f auto_continue="true" || {
+                echo "⚠️ 'gh workflow run' failed. Falling back to GitHub REST API dispatch..."
+                curl -s -X POST \
+                  -H "Authorization: Bearer $GH_TOKEN" \
+                  -H "Accept: application/vnd.github+json" \
+                  "https://api.github.com/repos/${{ github.repository }}/actions/workflows/javhd_enrich.yml/dispatches" \
+                  -d "{\"ref\":\"${{ github.ref_name || 'main' }}\",\"inputs\":{\"direction\":\"$DIRECTION\",\"limit\":\"$BATCH_LIMIT\",\"max_minutes\":\"$MAX_MINUTES\",\"max_part_mb\":\"$MAX_PART_MB\",\"auto_continue\":\"true\"}}"
+              }
+            echo "✅ Next workflow run for ($DIRECTION) successfully queued!"
           else
             echo "🎉 ALL catalog titles are 100% enriched! JAVHD scraper pipeline complete."
           fi

@@ -11,6 +11,8 @@
     "index": "node src/indexer.js",
     "repair": "node src/repair.js",
     "enrich:test": "node src/enricher.js --test",
+    "enrich:asc": "node src/enricher.js --direction asc",
+    "enrich:desc": "node src/enricher.js --direction desc",
     "enrich": "node src/enricher.js",
     "probe": "node src/probe.js",
     "check": "node src/check-continue.js",

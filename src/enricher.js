@@ -30,7 +30,8 @@ function parseArgs() {
         maxMinutes: 270, // 4.5 hours safe cutoff for GitHub Actions
         maxPartMb: 85,
         targetId: null,
-        targetUrl: null
+        targetUrl: null,
+        direction: 'desc' // 'desc' (newest first) or 'asc' (oldest first)
     };
 
     for (let i = 0; i < args.length; i++) {
@@ -40,6 +41,9 @@ function parseArgs() {
         } else if (args[i] === '--limit' && args[i + 1]) {
             const parsed = parseInt(args[i + 1], 10);
             options.limit = parsed > 0 ? parsed : Infinity;
+            i++;
+        } else if (args[i] === '--direction' && args[i + 1]) {
+            options.direction = args[i + 1].toLowerCase();
             i++;
         } else if (args[i] === '--batch' && args[i + 1]) {
             const parsed = parseInt(args[i + 1], 10);
@@ -219,12 +223,17 @@ export async function runEnricher() {
         return;
     }
 
+    if (opts.direction === 'asc') {
+        pendingItems.reverse();
+    }
+
     const maxToProcess = Math.min(pendingItems.length, opts.limit, opts.batchSize);
 
     console.log(`\n======================================================`);
     console.log(`         🚀 JAVHD.TODAY ENRICHMENT WORKER             `);
     console.log(`======================================================`);
     console.log(`- Mode:       ${opts.isTest ? 'TEST (5 items)' : 'PRODUCTION'}`);
+    console.log(`- Direction:  ${opts.direction === 'asc' ? 'ASCENDING (Oldest first)' : 'DESCENDING (Newest first)'}`);
     console.log(`- Batch Size: ${maxToProcess}`);
     console.log(`- Delay:      ${opts.delayMs} ms`);
     console.log(`- Cooldown:   ${(opts.cooldownMs / 60000).toFixed(1)} mins (on Cloudflare rate limit)`);
@@ -328,7 +337,7 @@ export async function runEnricher() {
     console.log(`- Success:          ${successCount}`);
     console.log(`- Failed / Skipped: ${failedCount}`);
     console.log(`- Total Enriched:   ${partitionManager.allIds.size}`);
-    console.log(`- Total Partitions: ${partitionManager.partitions.length}`);
+    console.log(`- Total Partitions: ${partitionManager.parts?.length || 1}`);
     console.log(`- Elapsed:          ${totalSec}s (${avgRate} items/sec)`);
     console.log(`======================================================\n`);
 }
