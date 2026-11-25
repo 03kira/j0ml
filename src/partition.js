@@ -13,6 +13,7 @@ class EnrichedPart {
         this.filePath = filePath;
         this.partNum = partNum;
         this.items = items;
+        this.itemCount = Array.isArray(items) ? items.length : 0;
         this.dirty = false;
         this.size = 0;
     }
@@ -23,11 +24,12 @@ export class PartitionManager {
         this.enrichedDir = enrichedDir;
         this.maxPartSizeBytes = maxPartSizeBytes;
         this.silent = options.silent ?? false;
+        this.lightweight = options.lightweight ?? true;
         this.parts = [];
         this.allIds = new Set();
         this.allCodes = new Set();
         this.allSlugs = new Set();
-        this.index = new Map(); // identifier -> { part, itemIndex }
+        this.index = new Map(); // identifier -> { part, itemIndex } (only used when lightweight=false)
         this.activePart = null;
         this._init();
     }
@@ -58,8 +60,12 @@ export class PartitionManager {
             return;
         }
 
-        for (const pf of partFiles) {
+        for (let pIdx = 0; pIdx < partFiles.length; pIdx++) {
+            const pf = partFiles[pIdx];
+            const isLastFile = pIdx === partFiles.length - 1;
             const fullPath = path.join(this.enrichedDir, pf.file);
+            const stat = fs.statSync(fullPath);
+
             let items = [];
             try {
                 const content = fs.readFileSync(fullPath, 'utf8');
@@ -70,8 +76,9 @@ export class PartitionManager {
                 items = [];
             }
 
-            const stat = fs.statSync(fullPath);
-            const part = new EnrichedPart(fullPath, pf.partNum, items);
+            const keepItemsInMemory = !this.lightweight || (isLastFile && stat.size < this.maxPartSizeBytes);
+            const part = new EnrichedPart(fullPath, pf.partNum, keepItemsInMemory ? items : null);
+            part.itemCount = items.length;
             part.size = stat.size;
             this.parts.push(part);
 
@@ -79,24 +86,28 @@ export class PartitionManager {
                 const it = items[i];
                 if (it && it.id != null) {
                     this.allIds.add(String(it.id));
-                    this.index.set(`id:${it.id}`, { part, itemIndex: i });
+                    if (!this.lightweight) this.index.set(`id:${it.id}`, { part, itemIndex: i });
                 }
                 if (it && it.code) {
-                    this.allCodes.add(String(it.code).toUpperCase());
-                    this.index.set(`code:${it.code.toUpperCase()}`, { part, itemIndex: i });
+                    const uc = String(it.code).toUpperCase();
+                    this.allCodes.add(uc);
+                    if (!this.lightweight) this.index.set(`code:${uc}`, { part, itemIndex: i });
                 }
                 if (it && it.slug) {
-                    this.allSlugs.add(String(it.slug).toLowerCase());
-                    this.index.set(`slug:${it.slug.toLowerCase()}`, { part, itemIndex: i });
+                    const ls = String(it.slug).toLowerCase();
+                    this.allSlugs.add(ls);
+                    if (!this.lightweight) this.index.set(`slug:${ls}`, { part, itemIndex: i });
                 }
             }
+            // Drop reference so V8 GC can immediately reclaim closed partition objects
+            items = null;
         }
 
         // Active part is the latest part
         this.activePart = this.parts[this.parts.length - 1];
 
         // Check if latest part is already full
-        if (this.activePart.size >= this.maxPartSizeBytes) {
+        if (this.activePart.size >= this.maxPartSizeBytes || this.activePart.items === null) {
             this._rotateNewPart();
         }
 
@@ -106,6 +117,11 @@ export class PartitionManager {
     }
 
     _rotateNewPart() {
+        const prevPart = this.activePart;
+        if (this.lightweight && prevPart && !prevPart.dirty && Array.isArray(prevPart.items)) {
+            prevPart.itemCount = prevPart.items.length;
+            prevPart.items = null; // Free memory of rotated closed partition
+        }
         const nextNum = this.parts.length + 1;
         const nextPath = path.join(this.enrichedDir, `javhd_enriched_part${nextNum}.json`);
         console.log(`[PartitionManager] 📦 Active partition reached limit (${(this.activePart.size / (1024 * 1024)).toFixed(1)} MB). Creating ${path.basename(nextPath)}`);
@@ -148,21 +164,24 @@ export class PartitionManager {
         }
 
         this.activePart.items.push(item);
+        this.activePart.itemCount = this.activePart.items.length;
         this.activePart.dirty = true;
         this.activePart.size += estimatedItemBytes;
 
         const newIdx = this.activePart.items.length - 1;
         if (item.id != null) {
             this.allIds.add(String(item.id));
-            this.index.set(`id:${item.id}`, { part: this.activePart, itemIndex: newIdx });
+            if (!this.lightweight) this.index.set(`id:${item.id}`, { part: this.activePart, itemIndex: newIdx });
         }
         if (item.code) {
-            this.allCodes.add(String(item.code).toUpperCase());
-            this.index.set(`code:${item.code.toUpperCase()}`, { part: this.activePart, itemIndex: newIdx });
+            const uc = String(item.code).toUpperCase();
+            this.allCodes.add(uc);
+            if (!this.lightweight) this.index.set(`code:${uc}`, { part: this.activePart, itemIndex: newIdx });
         }
         if (item.slug) {
-            this.allSlugs.add(String(item.slug).toLowerCase());
-            this.index.set(`slug:${item.slug.toLowerCase()}`, { part: this.activePart, itemIndex: newIdx });
+            const ls = String(item.slug).toLowerCase();
+            this.allSlugs.add(ls);
+            if (!this.lightweight) this.index.set(`slug:${ls}`, { part: this.activePart, itemIndex: newIdx });
         }
     }
 
@@ -197,11 +216,12 @@ export class PartitionManager {
         const partsSummary = [];
 
         for (const part of this.parts) {
-            totalItems += part.items.length;
+            const count = Array.isArray(part.items) ? part.items.length : (part.itemCount || 0);
+            totalItems += count;
             totalBytes += part.size;
             partsSummary.push({
                 file: path.basename(part.filePath),
-                items: part.items.length,
+                items: count,
                 sizeMB: (part.size / (1024 * 1024)).toFixed(2)
             });
         }

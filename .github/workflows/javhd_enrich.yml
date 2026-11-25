@@ -23,6 +23,10 @@ on:
         description: 'Max size in MB per partition file before sharding (default 85 to stay strictly under GitHub 100MB limit)'
         required: false
         default: '85'
+      max_repo_gb:
+        description: 'Stop workers if data/ or .git/ reaches this size in GB (default 8.5 to stay under GitHub 10GB limit)'
+        required: false
+        default: '8.5'
       auto_continue:
         description: 'Auto-restart workflow after 5 min cooldown if pending titles remain (true/false)'
         required: false
@@ -32,6 +36,8 @@ jobs:
   enrich:
     runs-on: ubuntu-latest
     timeout-minutes: 360
+    env:
+      NODE_OPTIONS: '--max-old-space-size=6144'
     permissions:
       contents: write
       actions: write
@@ -57,7 +63,8 @@ jobs:
             --direction ${{ github.event.inputs.direction || 'desc' }} \
             --limit ${{ github.event.inputs.limit || '0' }} \
             --max-minutes ${{ github.event.inputs.max_minutes || '270' }} \
-            --max-part-mb ${{ github.event.inputs.max_part_mb || '85' }}
+            --max-part-mb ${{ github.event.inputs.max_part_mb || '85' }} \
+            --max-repo-gb ${{ github.event.inputs.max_repo_gb || '8.5' }}
 
       - name: Commit and Push Enriched JSON Data
         if: always()
@@ -89,10 +96,21 @@ jobs:
           BATCH_LIMIT: ${{ github.event.inputs.limit || '0' }}
           MAX_MINUTES: ${{ github.event.inputs.max_minutes || '270' }}
           MAX_PART_MB: ${{ github.event.inputs.max_part_mb || '85' }}
+          MAX_REPO_GB: ${{ github.event.inputs.max_repo_gb || '8.5' }}
         run: |
           echo "=========================================================="
-          echo "🔍 Checking for remaining pending titles in catalog ($DIRECTION)..."
+          echo "🔍 Checking repo size limit (${MAX_REPO_GB} GB) & remaining titles ($DIRECTION)..."
           echo "=========================================================="
+
+          DATA_BYTES=$(du -sb data 2>/dev/null | awk '{print $1}' || echo 0)
+          GIT_BYTES=$(du -sb .git 2>/dev/null | awk '{print $1}' || echo 0)
+          MAX_BYTES=$(awk -v gb="$MAX_REPO_GB" 'BEGIN { printf "%.0f", gb * 1024 * 1024 * 1024 }')
+          echo "Storage check: data=${DATA_BYTES} bytes, .git=${GIT_BYTES} bytes, threshold=${MAX_BYTES} bytes (${MAX_REPO_GB} GB)"
+
+          if [ "$DATA_BYTES" -ge "$MAX_BYTES" ] || [ "$GIT_BYTES" -ge "$MAX_BYTES" ]; then
+            echo "🛑 Repo size threshold (${MAX_REPO_GB} GB) reached! Halting auto-continue to stay under GitHub 10 GB limit."
+            exit 0
+          fi
 
           CHECK_RESULT=$(node src/check-continue.js)
           echo "Status: $CHECK_RESULT"
@@ -110,13 +128,14 @@ jobs:
               -f limit="$BATCH_LIMIT" \
               -f max_minutes="$MAX_MINUTES" \
               -f max_part_mb="$MAX_PART_MB" \
+              -f max_repo_gb="$MAX_REPO_GB" \
               -f auto_continue="true" || {
                 echo "⚠️ 'gh workflow run' failed. Falling back to GitHub REST API dispatch..."
                 curl -s -X POST \
                   -H "Authorization: Bearer $GH_TOKEN" \
                   -H "Accept: application/vnd.github+json" \
                   "https://api.github.com/repos/${{ github.repository }}/actions/workflows/javhd_enrich.yml/dispatches" \
-                  -d "{\"ref\":\"${{ github.ref_name || 'main' }}\",\"inputs\":{\"direction\":\"$DIRECTION\",\"limit\":\"$BATCH_LIMIT\",\"max_minutes\":\"$MAX_MINUTES\",\"max_part_mb\":\"$MAX_PART_MB\",\"auto_continue\":\"true\"}}"
+                  -d "{\"ref\":\"${{ github.ref_name || 'main' }}\",\"inputs\":{\"direction\":\"$DIRECTION\",\"limit\":\"$BATCH_LIMIT\",\"max_minutes\":\"$MAX_MINUTES\",\"max_part_mb\":\"$MAX_PART_MB\",\"max_repo_gb\":\"$MAX_REPO_GB\",\"auto_continue\":\"true\"}}"
               }
             echo "✅ Next workflow run for ($DIRECTION) successfully queued!"
           else

@@ -14,10 +14,35 @@ import {
     CATALOG_FILE,
     CATALOG_DIR,
     CHECKPOINT_PATH,
+    DATA_DIR,
+    ROOT_DIR,
     DEFAULT_DELAY_MS,
     DEFAULT_COOLDOWN_MS,
     BASE_URL
 } from './config.js';
+
+function getDirSizeBytes(dirPath) {
+    if (!fs.existsSync(dirPath)) return 0;
+    let total = 0;
+    const entries = fs.readdirSync(dirPath, { withFileTypes: true });
+    for (const ent of entries) {
+        const full = path.join(dirPath, ent.name);
+        try {
+            if (ent.isDirectory()) {
+                total += getDirSizeBytes(full);
+            } else if (ent.isFile()) {
+                total += fs.statSync(full).size;
+            }
+        } catch {}
+    }
+    return total;
+}
+
+function getRepoStorageBytes() {
+    const dataBytes = getDirSizeBytes(DATA_DIR);
+    const gitBytes = getDirSizeBytes(path.join(ROOT_DIR, '.git'));
+    return { dataBytes, gitBytes, maxBytes: Math.max(dataBytes, gitBytes) };
+}
 
 function parseArgs() {
     const args = process.argv.slice(2);
@@ -29,6 +54,7 @@ function parseArgs() {
         cooldownMs: DEFAULT_COOLDOWN_MS,
         maxMinutes: 270, // 4.5 hours safe cutoff for GitHub Actions
         maxPartMb: 85,
+        maxRepoGb: 8.5,
         targetId: null,
         targetUrl: null,
         direction: 'desc' // 'desc' (newest first) or 'asc' (oldest first)
@@ -63,6 +89,10 @@ function parseArgs() {
             i++;
         } else if (args[i] === '--max-part-mb' && args[i + 1]) {
             options.maxPartMb = parseFloat(args[i + 1]);
+            i++;
+        } else if (args[i] === '--max-repo-gb' && args[i + 1]) {
+            const gb = parseFloat(args[i + 1]);
+            if (!isNaN(gb) && gb > 0) options.maxRepoGb = gb;
             i++;
         } else if (args[i] === '--id' && args[i + 1]) {
             options.targetId = args[i + 1];
@@ -155,6 +185,13 @@ export async function runEnricher() {
     const partitionManager = new PartitionManager(undefined, maxPartSizeBytes);
     const checkpoint = loadCheckpoint();
     const maxDurationMs = opts.maxMinutes * 60 * 1000;
+    const maxRepoBytes = opts.maxRepoGb * 1024 * 1024 * 1024;
+
+    const initialStorage = getRepoStorageBytes();
+    if (initialStorage.maxBytes >= maxRepoBytes) {
+        console.log(`\n🛑 Repo size threshold reached (${(initialStorage.maxBytes / (1024 ** 3)).toFixed(2)} GB >= ${opts.maxRepoGb} GB). Stopping to protect GitHub 10 GB repo limit.`);
+        return;
+    }
 
     if (!checkpoint.enrichment) {
         checkpoint.enrichment = {
@@ -198,21 +235,20 @@ export async function runEnricher() {
         return;
     }
 
-    // 2. Load Catalog Items
-    const catalog = loadAllCatalogItems(opts.isTest);
-    if (!catalog || catalog.length === 0) {
-        console.error(`[Enricher] ❌ No catalog items found in ${CATALOG_DIR}!`);
-        console.error(`Please run indexer first: npm run index:test (or npm run index:all)`);
-        process.exit(1);
-    }
-
-    console.log(`[Enricher] 📂 Loaded ${catalog.length} titles from catalog.`);
-
-    // 3. Filter Pending Items (not yet in PartitionManager)
-    const pendingItems = [];
-    for (const item of catalog) {
-        if (!partitionManager.has(item.id, item.code, item.slug)) {
-            pendingItems.push(item);
+    // 2. Load Catalog Items & Filter Pending (drop full catalog ref immediately to save heap)
+    let pendingItems = [];
+    {
+        const catalog = loadAllCatalogItems(opts.isTest);
+        if (!catalog || catalog.length === 0) {
+            console.error(`[Enricher] ❌ No catalog items found in ${CATALOG_DIR}!`);
+            console.error(`Please run indexer first: npm run index:test (or npm run index:all)`);
+            process.exit(1);
+        }
+        console.log(`[Enricher] 📂 Loaded ${catalog.length} titles from catalog.`);
+        for (const item of catalog) {
+            if (!partitionManager.has(item.id, item.code, item.slug)) {
+                pendingItems.push(item);
+            }
         }
     }
 
@@ -322,6 +358,12 @@ export async function runEnricher() {
             checkpoint.enrichment.totalEnriched = partitionManager.allIds.size;
             checkpoint.enrichment.lastUpdated = new Date().toISOString();
             saveCheckpoint(checkpoint);
+
+            const storage = getRepoStorageBytes();
+            if (storage.maxBytes >= maxRepoBytes) {
+                console.log(`\n🛑 Repo size threshold reached (${(storage.maxBytes / (1024 ** 3)).toFixed(2)} GB >= ${opts.maxRepoGb} GB). Stopping gracefully to commit & halt.`);
+                break;
+            }
         }
     }
 
